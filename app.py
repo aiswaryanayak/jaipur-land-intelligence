@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -33,6 +34,7 @@ def require_site_password():
         )
 BASE_DIR = Path(__file__).resolve().parent
 DATA_FILE = BASE_DIR / "deploy_data" / "auctions.json"
+LOCATION_DB_FILE = BASE_DIR / "data" / "jaipur_land_intelligence.sqlite3"
 IST = timezone(timedelta(hours=5, minutes=30))
 
 PAGE = r"""
@@ -96,9 +98,13 @@ footer{background:var(--navy);color:#dbe6f3;text-align:center;padding:22px;font-
 <div class="subtitle">Government land and property opportunity information portal</div>
 </div></div></header>
 <nav><div class="navinner">
-<a href="/">PROPERTY LISTINGS</a>
+<a href="/">OVERVIEW</a>
+<a href="/authority/jda">JDA</a>
+<a href="/authority/riico">RIICO</a>
+<a href="/authority/other">OTHER AUTHORITIES</a>
 <a href="https://jda.rajasthan.gov.in/" target="_blank" rel="noopener">JDA OFFICIAL WEBSITE ↗</a>
 <a href="https://udhonline.rajasthan.gov.in/Portal/AuctionListNew" target="_blank" rel="noopener">UDH E-AUCTIONS ↗</a>
+<a href="https://www.riicoerp.industries.rajasthan.gov.in/eauction" target="_blank" rel="noopener">RIICO E-AUCTIONS ↗</a>
 <a href="https://eproc.rajasthan.gov.in/" target="_blank" rel="noopener">RAJASTHAN E-PROCUREMENT ↗</a>
 </div></nav>
 <main>
@@ -108,6 +114,18 @@ footer{background:var(--navy);color:#dbe6f3;text-align:center;padding:22px;font-
 <div class="notice"><strong>Verification notice:</strong> These records are collected from official catalogue pages.
 A future deadline does not prove that an auction is open or a property is available.
 Check the latest official auction details, corrigenda and notices before acting.</div>
+<section class="card">
+<h3>Automated source refresh</h3>
+{% if refresh_status %}
+<p class="muted">Run {{ refresh_status.run_id }} · checked {{ refresh_status.checked_at }}</p>
+<div class="details">{% for source in refresh_status.sources %}
+<div class="detail"><small>{{ source.source_key }}</small><strong>{{ source.fetch_status }} · {{ source.record_count }} records{% if source.error %} · {{ source.error }}{% endif %}</strong></div>
+{% endfor %}</div>
+<p class="muted">Refresh output is staged for review. It is not automatically promoted into this catalogue.</p>
+{% else %}
+<p class="muted">No refresh manifest is available. Run the local refresh command to populate source health information.</p>
+{% endif %}
+</section>
 <section class="stats">
 <div class="stat"><strong>{{ total }}</strong><span>Unique auction IDs in collected catalogue</span></div>
 <div class="stat"><strong>{{ upcoming }}</strong><span>Records with a future parsed bid deadline</span></div>
@@ -138,7 +156,7 @@ Check the latest official auction details, corrigenda and notices before acting.
 <article class="card">
 <span class="pill">{{ item.category_label }}</span>
 <span class="pill warn">Official status not verified</span>
-<h3>{{ item.title }}</h3>
+<h3><a href="/property/{{ item.auction_id }}">{{ item.title }}</a></h3>
 <div class="muted">Auction ID: {{ item.auction_id }}</div>
 <div class="details">
 <div class="detail"><small>Scheme</small><strong>{{ item.scheme }}</strong></div>
@@ -344,7 +362,9 @@ def load_catalogue():
             "usage": usage,
             "emd": emd,
             "assessed_value": assessed or "Not stated",
+            "emd_start": emd_start or "Not reliably extracted",
             "emd_end": emd_end or "Not reliably extracted",
+            "bid_start": bid_start or "Not reliably extracted",
             "bid_end": bid_end or "Not reliably extracted",
             "category": category,
             "category_label": category_label,
@@ -354,6 +374,7 @@ def load_catalogue():
             "detail_links": list(dict.fromkeys(detail_links)),
             "provenance_count": len(observations),
             "raw_text": row,
+            "source_authority": text(rec.get("source_authority")) or "Unspecified authority",
             "_bid_dt": bid_dt,
         })
 
@@ -366,6 +387,17 @@ def load_catalogue():
     if snapshot_file:
         retrieved_at = f"{retrieved_at} · latest refresh snapshot"
     return items, retrieved_at
+
+
+def load_refresh_status():
+    path = BASE_DIR / "data" / "refresh_pipeline" / "latest.json"
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 
@@ -444,7 +476,217 @@ def home():
         needs_check=len(items),
         retrieved_at=retrieved_at,
         deadline_filter=deadline_filter,
+        refresh_status=load_refresh_status(),
     )
+
+
+AUTHORITY_PAGE = r"""
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }} · Jaipur Land Intelligence</title>
+<style>
+body{margin:0;background:#f3f6fa;color:#263447;font-family:Arial,Helvetica,sans-serif}
+header{background:#173354;color:white;padding:24px max(20px,calc((100% - 1180px)/2))}
+nav{background:white;border-bottom:1px solid #dbe3ed;padding:13px 20px}
+nav div{max-width:1180px;margin:auto;display:flex;gap:18px;flex-wrap:wrap}
+nav a{font-size:12px;font-weight:bold;color:#173354;text-decoration:none}
+main{max-width:1180px;margin:26px auto;padding:0 18px 45px}
+h1{margin:0;font-size:24px}h2{color:#173354}.muted{font-size:13px;color:#64748b;line-height:1.5}
+.notice{background:#fff9e9;border-left:4px solid #e6b951;padding:13px 15px;font-size:13px;line-height:1.6;margin:20px 0}
+.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin:20px 0}
+.stat,.filters,.card,.empty{background:white;border:1px solid #dbe3ed;border-radius:8px}
+.stat{padding:17px}.stat strong{display:block;font-size:25px;color:#173354}.stat span{font-size:12px;color:#64748b}
+.filters{padding:15px;display:grid;grid-template-columns:2fr 1fr 1fr auto;gap:12px}
+input,select,button{min-width:0;width:100%;font:inherit;padding:12px;border:1px solid #cbd5e1;border-radius:5px;background:white}
+button{background:#173354;border-color:#173354;color:white;font-weight:bold}
+.results{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:18px}
+.card{padding:18px}.card h3{color:#173354;line-height:1.45}.pill{display:inline-block;font-size:11px;font-weight:bold;border-radius:20px;padding:5px 9px;background:#edf2f7;color:#34445b;margin:2px 4px 2px 0}
+.warn{background:#fff1d0;color:#805600}.past{background:#fce8e8;color:#9b2424}.future{background:#e3f5e9;color:#17633a}
+.details{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:15px 0}.detail{border-top:1px solid #edf0f4;padding-top:9px}.detail small{display:block;color:#64748b;font-size:11px}.detail strong{display:block;font-size:13px;line-height:1.45}
+.links{display:flex;flex-wrap:wrap;gap:12px}.links a{color:#245b91;font-size:12px;font-weight:bold}.empty{padding:35px;text-align:center;grid-column:1/-1}
+@media(max-width:720px){.stats,.filters,.results{grid-template-columns:1fr}}
+</style></head><body>
+<header><h1>{{ title }}</h1><div class="muted" style="color:#dbe6f3">Authority-filtered opportunity records</div></header>
+<nav><div><a href="/">OVERVIEW</a><a href="/authority/jda">JDA</a><a href="/authority/riico">RIICO</a><a href="/authority/other">OTHER AUTHORITIES</a></div></nav>
+<main><h2>{{ heading }}</h2><p class="muted">{{ description }}</p>
+<div class="notice"><strong>Status caution:</strong> Published dates and source records do not certify current availability. Confirm the latest official notice before acting.</div>
+<section class="stats"><div class="stat"><strong>{{ results|length }}</strong><span>Matching records</span></div><div class="stat"><strong>{{ total }}</strong><span>Canonical records for this authority</span></div><div class="stat"><strong>{{ upcoming }}</strong><span>Future published bid deadlines</span></div></section>
+<form class="filters" method="get"><input name="q" value="{{ q }}" placeholder="Search scheme, plot or auction ID">
+<select name="category"><option value="all">All property types</option><option value="residential" {% if category=='residential' %}selected{% endif %}>Residential</option><option value="commercial" {% if category=='commercial' %}selected{% endif %}>Commercial</option><option value="other" {% if category=='other' %}selected{% endif %}>Other</option></select>
+<select name="deadline"><option value="all">All statuses</option><option value="upcoming" {% if deadline=='upcoming' %}selected{% endif %}>Upcoming</option><option value="passed" {% if deadline=='passed' %}selected{% endif %}>Closed / passed</option><option value="unknown" {% if deadline=='unknown' %}selected{% endif %}>Needs verification</option></select>
+<button type="submit">Filter</button></form>
+<section class="results">{% for item in results %}<article class="card">
+<span class="pill">{{ item.category_label }}</span><span class="pill {{ item.status_class }}">{{ item.deadline_status }}</span>
+<h3><a href="/property/{{ item.auction_id }}">{{ item.title }}</a></h3><div class="muted">{{ item.source_authority }} · Auction ID {{ item.auction_id }}</div>
+<div class="details"><div class="detail"><small>Scheme / industrial area</small><strong>{{ item.scheme }}</strong></div><div class="detail"><small>Property / plot</small><strong>{{ item.property_number }}</strong></div><div class="detail"><small>Area</small><strong>{{ item.area }}</strong></div><div class="detail"><small>Land use</small><strong>{{ item.usage }}</strong></div><div class="detail"><small>Reserve / assessed value</small><strong>{{ item.assessed_value }}</strong></div><div class="detail"><small>EMD</small><strong>{{ item.emd }}</strong></div><div class="detail"><small>Application / EMD dates</small><strong>{{ item.emd_start }} to {{ item.emd_end }}</strong></div><div class="detail"><small>Bid dates</small><strong>{{ item.bid_start }} to {{ item.bid_end }}</strong></div></div>
+<div class="links">{% for link in item.detail_links + item.listing_links %}<a href="{{ link }}" target="_blank" rel="noopener">Official source ↗</a>{% endfor %}</div>
+</article>{% else %}<div class="empty"><strong>No records available for this authority and filter.</strong><p class="muted">RIICO and other-authority records remain in staging until official identifiers and fields are reviewed.</p></div>{% endfor %}</section>
+</main></body></html>
+"""
+
+
+@app.route("/authority/<authority_key>")
+def authority_page(authority_key):
+    authority_map = {
+        "jda": ("Jaipur Development Authority", "JDA opportunities", "Canonical JDA auction records from the existing collected catalogue."),
+        "riico": ("RIICO", "RIICO opportunities", "No RIICO records are published yet. Official RIICO sources are being audited in a separate staging dataset."),
+        "other": ("Other verified authorities", "Other verified-authority opportunities", "No additional verified-authority records are available in the reviewed catalogue or staging dataset."),
+    }
+    if authority_key not in authority_map:
+        return "Authority page not found", 404
+    authority, heading, description = authority_map[authority_key]
+    try:
+        items, _ = load_catalogue()
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return f"<h1>Could not load catalogue</h1><pre>{str(exc)}</pre>", 500
+    filtered = [item for item in items if (
+        (authority_key == "jda" and item["source_authority"].casefold() == authority.casefold())
+        or (authority_key == "riico" and item["source_authority"].casefold() == "riico")
+        or (authority_key == "other" and item["source_authority"].casefold() not in {"jaipur development authority", "riico"})
+    )]
+    q = request.args.get("q", "").strip().casefold()
+    category = request.args.get("category", "all").strip().lower()
+    deadline = request.args.get("deadline", "all").strip().lower()
+    if category not in {"all", "residential", "commercial", "other"}:
+        category = "all"
+    if deadline not in {"all", "upcoming", "passed", "unknown"}:
+        deadline = "all"
+    total = len(filtered)
+    now = datetime.now(IST)
+    results = []
+    for item in filtered:
+        searchable = " ".join(str(item[k]) for k in ("auction_id", "title", "scheme", "property_number", "area", "usage")).casefold()
+        if q and q not in searchable:
+            continue
+        if category != "all" and item["category"] != category:
+            continue
+        if item["_bid_dt"] is None:
+            item["deadline_status"], item["status_class"], group = "Needs verification", "warn", "unknown"
+        elif item["_bid_dt"] < now:
+            item["deadline_status"], item["status_class"], group = "Published bid deadline passed", "past", "passed"
+        else:
+            item["deadline_status"], item["status_class"], group = "Future published deadline — verify", "future", "upcoming"
+        if deadline != "all" and deadline != group:
+            continue
+        results.append(item)
+    upcoming = sum(1 for item in filtered if item["_bid_dt"] and item["_bid_dt"] >= now)
+    return render_template_string(AUTHORITY_PAGE, title="Jaipur Land Intelligence", heading=heading,
+        description=description, results=results, total=total, upcoming=upcoming, q=request.args.get("q", ""),
+        category=category, deadline=deadline)
+
+
+def load_scheme_location(scheme_name):
+    """Read one exact, reviewed scheme-level location without changing the database."""
+    normalized = re.sub(r"\s+", " ", str(scheme_name or "")).strip().casefold()
+    if not normalized or not LOCATION_DB_FILE.exists():
+        return None
+
+    uri = f"file:{LOCATION_DB_FILE.as_posix()}?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True) as connection:
+            row = connection.execute(
+                """
+                SELECT sl.label, l.latitude, l.longitude, l.precision,
+                       l.status, l.source_url, l.evidence_notes,
+                       l.coordinate_subject, l.verification_status, l.confidence
+                FROM scheme_labels AS sl
+                JOIN locations AS l ON l.scheme_label_id = sl.id
+                WHERE sl.normalized_label = ?
+                  AND l.status IN ('provisional', 'verified')
+                ORDER BY CASE l.status WHEN 'verified' THEN 0 ELSE 1 END, l.id
+                LIMIT 1
+                """,
+                (normalized,),
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise RuntimeError("Could not read the scheme-location database.") from exc
+
+    if row is None:
+        return None
+
+    return {
+        "scheme_label": row[0],
+        "latitude": row[1],
+        "longitude": row[2],
+        "precision": row[3],
+        "status": row[4],
+        "source_url": row[5],
+        "evidence_notes": row[6],
+        "coordinate_subject": row[7],
+        "verification_status": row[8],
+        "confidence": row[9],
+    }
+
+
+DETAIL_PAGE = r"""
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ item.title }} · Jaipur Land Intelligence</title>
+<style>
+:root{--navy:#173354;--blue:#245b91;--ink:#263447;--muted:#64748b;--line:#dbe3ed;--bg:#f3f6fa;--white:#fff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Arial,Helvetica,sans-serif}
+header{background:var(--navy);color:white;padding:24px max(20px,calc((100% - 1000px)/2))}h1{font-size:23px;line-height:1.4;margin:0}.subtitle{font-size:13px;color:#dbe6f3;margin-top:6px}
+nav{background:white;border-bottom:1px solid var(--line);padding:13px 20px}nav a{max-width:1000px;margin:auto;display:block;color:var(--blue);font-size:13px;font-weight:bold;text-decoration:none}
+main{max-width:1000px;margin:25px auto;padding:0 18px 45px}.panel{background:white;border:1px solid var(--line);border-radius:9px;padding:22px;margin-bottom:16px}.muted{font-size:13px;color:var(--muted);line-height:1.6}.pill{display:inline-block;font-size:11px;font-weight:bold;border-radius:20px;padding:6px 10px;background:#edf2f7;color:#34445b;margin:2px 4px 2px 0}.warn{background:#fff1d0;color:#805600}.past{background:#fce8e8;color:#9b2424}.future{background:#e3f5e9;color:#17633a}
+h2{font-size:17px;color:var(--navy);margin:0 0 14px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 20px}.detail{padding:12px 0;border-top:1px solid #edf0f4;min-width:0}.detail small{display:block;color:var(--muted);font-size:11px;margin-bottom:6px}.detail strong{font-size:14px;line-height:1.5;overflow-wrap:anywhere}.links{display:flex;flex-wrap:wrap;gap:12px;margin-top:12px}.links a{color:var(--blue);font-size:13px;font-weight:bold;overflow-wrap:anywhere}.notice{background:#fff9e9;border-left:4px solid #e6b951;padding:13px 15px;font-size:13px;line-height:1.6;margin-bottom:16px}.raw{font-size:13px;background:#f7f9fc;border-radius:5px;padding:12px;overflow-wrap:anywhere;line-height:1.6;white-space:pre-wrap}.map-frame{width:100%;height:360px;border:1px solid var(--line);border-radius:7px;overflow:hidden;margin:14px 0}.map-frame iframe{width:100%;height:100%;border:0}@media(max-width:650px){.grid{grid-template-columns:1fr}.map-frame{height:280px}header{padding:20px}}
+</style></head><body>
+<header><h1>{{ item.title }}</h1><div class="subtitle">Jaipur Land Intelligence · Property record</div></header>
+<nav><a href="{{ back_url }}">← Back to property listings</a></nav>
+<main>
+<div class="notice"><strong>Important:</strong> This page organizes collected catalogue information. It does not certify that the property is available or that an auction is currently open. Confirm current status, eligibility, terms, notices and corrigenda with the official authority.</div>
+<section class="panel"><span class="pill">{{ item.category_label }}</span><span class="pill warn">Official status not verified</span><span class="pill {{ item.status_class }}">{{ item.deadline_status }}</span><p class="muted">Auction ID: {{ item.auction_id }} · {{ item.provenance_count }} collected observation(s) for this ID</p>
+<h2>Property and auction details</h2><div class="grid">
+<div class="detail"><small>Property title</small><strong>{{ item.title }}</strong></div><div class="detail"><small>Auction ID</small><strong>{{ item.auction_id }}</strong></div>
+<div class="detail"><small>Scheme</small><strong>{{ item.scheme }}</strong></div><div class="detail"><small>Property / plot number</small><strong>{{ item.property_number }}</strong></div>
+<div class="detail"><small>Area</small><strong>{{ item.area }}</strong></div><div class="detail"><small>Usage</small><strong>{{ item.usage }}</strong></div>
+<div class="detail"><small>EMD amount</small><strong>{{ item.emd }}</strong></div><div class="detail"><small>Assessed value (source-listed)</small><strong>{{ item.assessed_value }}</strong></div>
+<div class="detail"><small>EMD start (listed)</small><strong>{{ item.emd_start }}</strong></div><div class="detail"><small>EMD deadline (listed)</small><strong>{{ item.emd_end }}</strong></div>
+<div class="detail"><small>Bid start (listed)</small><strong>{{ item.bid_start }}</strong></div><div class="detail"><small>Bid deadline (listed)</small><strong>{{ item.bid_end }}</strong></div>
+</div></section>
+{% if item.map_location %}
+<section class="panel"><h2>Navigate to the scheme area</h2>
+<div class="notice"><strong>Location accuracy:</strong> This is a {{ item.map_location.precision }} pin for {{ item.map_location.coordinate_subject or "a reviewed location" }}. {% if item.map_location.precision == "locality_only" %}<strong>Locality navigation only:</strong> the actual scheme boundary and plot are unverified.{% else %}It is not the exact plot location, entrance, or legal boundary.{% endif %} Confirm the plot against the official location plan before visiting or making a decision.</div>
+<p><strong>{{ item.map_location.scheme_label }}</strong></p>
+<p class="muted">Verification status: {{ item.map_location.status }} / {{ item.map_location.verification_status or "not separately recorded" }} · Confidence: {{ item.map_location.confidence or "not recorded" }} · Coordinates: {{ "%.6f"|format(item.map_location.latitude) }}, {{ "%.6f"|format(item.map_location.longitude) }}</p>
+<div class="map-frame"><iframe title="Scheme-area map" loading="lazy" referrerpolicy="no-referrer-when-downgrade" src="https://maps.google.com/maps?q={{ item.map_location.latitude }},{{ item.map_location.longitude }}&z=14&output=embed" allowfullscreen></iframe></div>
+<div class="links"><a href="https://www.google.com/maps/dir/?api=1&destination={{ item.map_location.latitude }},{{ item.map_location.longitude }}" target="_blank" rel="noopener noreferrer">Get directions to scheme area ↗</a>{% if item.map_location.source_url %}<a href="{{ item.map_location.source_url }}" target="_blank" rel="noopener noreferrer">Open location source ↗</a>{% endif %}</div>
+<p class="muted">{{ item.map_location.evidence_notes }}</p>
+</section>
+{% else %}
+<section class="panel"><h2>Location</h2><p class="muted"><strong>Location not yet verified.</strong> No suitable reviewed scheme-area location record is available for this exact scheme label. We are not guessing coordinates from the scheme or plot name.</p></section>
+{% endif %}
+<section class="panel"><h2>Official source records</h2><p class="muted">These links are preserved from collected records; they are not reconstructed by this page.</p>
+{% if item.detail_links or item.listing_links %}<div class="links">
+{% for link in item.detail_links %}<a href="{{ link }}" target="_blank" rel="noopener noreferrer">{% if loop.first %}Official property details{% else %}Alternate property details{% endif %} ↗</a>{% endfor %}
+{% for link in item.listing_links %}<a href="{{ link }}" target="_blank" rel="noopener noreferrer">{% if loop.first %}Official auction listing{% else %}Alternate official listing{% endif %} ↗</a>{% endfor %}
+</div>{% else %}<p class="muted">No official source link was captured for this record.</p>{% endif %}</section>
+<section class="panel"><h2>Collected source text</h2><p class="muted">Original row text retained for traceability. This is not a substitute for the latest official notice.</p><div class="raw">{{ item.raw_text or 'No original row text captured.' }}</div></section>
+</main><footer>Jaipur Land Intelligence · Prototype · Verify current status through official sources.</footer></body></html>
+"""
+
+
+@app.route("/property/<auction_id>")
+def property_detail(auction_id):
+    try:
+        items, _retrieved_at = load_catalogue()
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return f"<h1>Could not load catalogue</h1><pre>{str(exc)}</pre>", 500
+
+    item = next((entry for entry in items if entry["auction_id"] == str(auction_id)), None)
+    if item is None:
+        return "<h1>Property record not found</h1><p>This auction ID is not in the current catalogue.</p><p><a href='/'>Back to listings</a></p>", 404
+
+    try:
+        item["map_location"] = load_scheme_location(item["scheme"])
+    except RuntimeError as exc:
+        return f"<h1>Could not load scheme location</h1><pre>{str(exc)}</pre>", 500
+    back_url = "/"
+    if request.args:
+        from urllib.parse import urlencode
+        back_url += "?" + urlencode(request.args)
+    return render_template_string(DETAIL_PAGE, item=item, back_url=back_url)
 
 
 
