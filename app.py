@@ -34,6 +34,7 @@ def require_site_password():
         )
 BASE_DIR = Path(__file__).resolve().parent
 DATA_FILE = BASE_DIR / "deploy_data" / "auctions.json"
+AUTHORITY_DATA_FILE = BASE_DIR / "deploy_data" / "authority_records.json"
 LOCATION_DB_FILE = BASE_DIR / "data" / "jaipur_land_intelligence.sqlite3"
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -146,6 +147,12 @@ Check the latest official auction details, corrigenda and notices before acting.
   <option value="passed" {% if deadline_filter == 'passed' %}selected{% endif %}>Bid deadline passed</option>
   <option value="unknown" {% if deadline_filter == 'unknown' %}selected{% endif %}>Needs verification</option>
 </select>
+<div class="price-filter">
+<label for="min_price">Minimum price: ₹{{ "{:,.0f}".format(min_price) }}</label>
+<input id="min_price" name="min_price" type="range" min="{{ price_min }}" max="{{ price_max }}" step="1" value="{{ min_price }}">
+<label for="max_price">Maximum price: ₹{{ "{:,.0f}".format(max_price) }}</label>
+<input id="max_price" name="max_price" type="range" min="{{ price_min }}" max="{{ price_max }}" step="1" value="{{ max_price }}">
+</div>
 <button type="submit">Search listings</button>
 
 </form>
@@ -376,6 +383,7 @@ def load_catalogue():
             "raw_text": row,
             "source_authority": text(rec.get("source_authority")) or "Unspecified authority",
             "_bid_dt": bid_dt,
+            "_price": numeric_price(assessed),
         })
 
     items.sort(key=lambda item: (
@@ -387,6 +395,59 @@ def load_catalogue():
     if snapshot_file:
         retrieved_at = f"{retrieved_at} · latest refresh snapshot"
     return items, retrieved_at
+
+
+def numeric_price(value):
+    match = re.search(r"\d[\d,]*(?:\.\d+)?", text(value))
+    if not match:
+        return None
+    try:
+        return float(match.group(0).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def load_authority_records(authority_key):
+    if not AUTHORITY_DATA_FILE.exists():
+        return []
+    try:
+        payload = json.loads(AUTHORITY_DATA_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+    records = payload.get("records", []) if isinstance(payload, dict) else []
+    selected = []
+    for record in records:
+        if not isinstance(record, dict) or record.get("_display_authority") != authority_key:
+            continue
+        status = text(record.get("current_status")) or "status not verified"
+        selected.append({
+            "auction_id": text(record.get("original_identifier")) or text(record.get("record_key")),
+            "title": text(record.get("title")) or "Untitled authority record",
+            "scheme": text(record.get("scheme_or_industrial_area")) or "Not stated",
+            "property_number": text(record.get("property_or_plot_number")) or "Not stated",
+            "area": text(record.get("area")) or "Not stated",
+            "usage": text(record.get("land_use_category")) or "Not stated",
+            "emd": text(record.get("emd")) or "Not stated",
+            "assessed_value": text(record.get("reserve_price_or_rate")) or "Not stated",
+            "emd_start": text(record.get("application_start")) or "Not stated",
+            "emd_end": text(record.get("application_end")) or "Not stated",
+            "bid_start": text(record.get("bid_start")) or "Not stated",
+            "bid_end": text(record.get("bid_end")) or "Not stated",
+            "category": "other",
+            "category_label": "Historical allotment" if authority_key != "riico" else "RIICO industrial record",
+            "deadline_status": status,
+            "status_class": "past" if "historical" in status or "closed" in status else "warn",
+            "listing_links": [record["source_url"]] if text(record.get("source_url")).startswith("https://") else [],
+            "detail_links": [],
+            "provenance_count": 1,
+            "raw_text": text(record.get("notes")),
+            "source_authority": text(record.get("authority")),
+            "_bid_dt": parse_date(text(record.get("bid_end"))),
+            "_price": numeric_price(record.get("reserve_price_or_rate")),
+            "_source_status": status.casefold(),
+            "_display_record": True,
+        })
+    return selected
 
 
 def load_refresh_status():
@@ -414,6 +475,19 @@ def home():
     q = request.args.get("q", "").strip().lower()
     category = request.args.get("category", "all").strip().lower()
     deadline_filter = request.args.get("deadline", "all").strip().lower()
+    price_values = [item["_price"] for item in items if item["_price"] is not None]
+    price_min = min(price_values) if price_values else 0
+    price_max = max(price_values) if price_values else 0
+    try:
+        min_price = max(price_min, float(request.args.get("min_price", price_min)))
+    except (TypeError, ValueError):
+        min_price = price_min
+    try:
+        max_price = min(price_max, float(request.args.get("max_price", price_max)))
+    except (TypeError, ValueError):
+        max_price = price_max
+    if min_price > max_price:
+        min_price, max_price = max_price, min_price
 
     if category not in {"all", "residential", "commercial", "other"}:
         category = "all"
@@ -438,6 +512,10 @@ def home():
             continue
 
         if category != "all" and item["category"] != category:
+            continue
+        if item["_price"] is not None and not (min_price <= item["_price"] <= max_price):
+            continue
+        if item["_price"] is None and (min_price > price_min or max_price < price_max):
             continue
 
         bid_dt = item["_bid_dt"]
@@ -476,6 +554,10 @@ def home():
         needs_check=len(items),
         retrieved_at=retrieved_at,
         deadline_filter=deadline_filter,
+        min_price=min_price,
+        max_price=max_price,
+        price_min=price_min,
+        price_max=price_max,
         refresh_status=load_refresh_status(),
     )
 
@@ -496,7 +578,8 @@ h1{margin:0;font-size:24px}h2{color:#173354}.muted{font-size:13px;color:#64748b;
 .stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin:20px 0}
 .stat,.filters,.card,.empty{background:white;border:1px solid #dbe3ed;border-radius:8px}
 .stat{padding:17px}.stat strong{display:block;font-size:25px;color:#173354}.stat span{font-size:12px;color:#64748b}
-.filters{padding:15px;display:grid;grid-template-columns:2fr 1fr 1fr auto;gap:12px}
+.filters{padding:15px;display:grid;grid-template-columns:2fr 1fr 1fr 2fr auto;gap:12px}
+.price-filter{display:grid;gap:4px;color:#64748b;font-size:12px}.price-filter input{padding:0}
 input,select,button{min-width:0;width:100%;font:inherit;padding:12px;border:1px solid #cbd5e1;border-radius:5px;background:white}
 button{background:#173354;border-color:#173354;color:white;font-weight:bold}
 .results{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:18px}
@@ -529,8 +612,8 @@ button{background:#173354;border-color:#173354;color:white;font-weight:bold}
 def authority_page(authority_key):
     authority_map = {
         "jda": ("Jaipur Development Authority", "JDA opportunities", "Canonical JDA auction records from the existing collected catalogue."),
-        "riico": ("RIICO", "RIICO opportunities", "No RIICO records are published yet. Official RIICO sources are being audited in a separate staging dataset."),
-        "other": ("Other verified authorities", "Other verified-authority opportunities", "No additional verified-authority records are available in the reviewed catalogue or staging dataset."),
+        "riico": ("RIICO", "RIICO reviewed records", "Reviewed RIICO e-auction records are shown as closed or unavailable where the 14 October 2026 EMD deadline has passed. They are not new-application opportunities."),
+        "other": ("Other verified authorities", "Historical authority records", "Historical RHB allotment outcomes and JDA institutional land allotments are shown for reference only. No current purchasable opportunity is asserted."),
     }
     if authority_key not in authority_map:
         return "Authority page not found", 404
@@ -539,11 +622,16 @@ def authority_page(authority_key):
         items, _ = load_catalogue()
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         return f"<h1>Could not load catalogue</h1><pre>{str(exc)}</pre>", 500
-    filtered = [item for item in items if (
+    if authority_key == "riico":
+        filtered = load_authority_records("riico")
+    elif authority_key == "other":
+        filtered = load_authority_records("rhb") + load_authority_records("jda")
+    else:
+        filtered = [item for item in items if (
         (authority_key == "jda" and item["source_authority"].casefold() == authority.casefold())
         or (authority_key == "riico" and item["source_authority"].casefold() == "riico")
         or (authority_key == "other" and item["source_authority"].casefold() not in {"jaipur development authority", "riico"})
-    )]
+        )]
     q = request.args.get("q", "").strip().casefold()
     category = request.args.get("category", "all").strip().lower()
     deadline = request.args.get("deadline", "all").strip().lower()
@@ -560,7 +648,9 @@ def authority_page(authority_key):
             continue
         if category != "all" and item["category"] != category:
             continue
-        if item["_bid_dt"] is None:
+        if "historical" in item.get("_source_status", "") or "closed" in item.get("_source_status", ""):
+            item["deadline_status"], item["status_class"], group = item["_source_status"], "past", "passed"
+        elif item["_bid_dt"] is None:
             item["deadline_status"], item["status_class"], group = "Needs verification", "warn", "unknown"
         elif item["_bid_dt"] < now:
             item["deadline_status"], item["status_class"], group = "Published bid deadline passed", "past", "passed"
@@ -673,8 +763,10 @@ def property_detail(auction_id):
         items, _retrieved_at = load_catalogue()
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         return f"<h1>Could not load catalogue</h1><pre>{str(exc)}</pre>", 500
-
     item = next((entry for entry in items if entry["auction_id"] == str(auction_id)), None)
+    if item is None:
+        staged = load_authority_records("riico") + load_authority_records("rhb") + load_authority_records("jda")
+        item = next((entry for entry in staged if entry["auction_id"] == str(auction_id)), None)
     if item is None:
         return "<h1>Property record not found</h1><p>This auction ID is not in the current catalogue.</p><p><a href='/'>Back to listings</a></p>", 404
 

@@ -81,6 +81,12 @@ the current Render deployment cannot safely serve the reviewed SQLite location
 data. Do not deploy this repository as if the ignored local database were
 available remotely.
 
+The read-only `deploy_data/authority_records.json` snapshot powers the RIICO
+and Other Authorities reference pages. It contains reviewed staged records
+without promoting them into the SQLite catalogue. RIICO rows whose EMD deadline
+has passed are displayed as closed/unavailable, and RHB/JDA allotment rows are
+displayed as historical outcomes rather than active opportunities.
+
 ## Automated source refresh (local staging only)
 
 The repeatable refresh command is:
