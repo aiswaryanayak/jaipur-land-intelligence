@@ -148,10 +148,11 @@ Check the latest official auction details, corrigenda and notices before acting.
   <option value="unknown" {% if deadline_filter == 'unknown' %}selected{% endif %}>Needs verification</option>
 </select>
 <div class="price-filter">
-<label for="min_price">Minimum price: ₹{{ "{:,.0f}".format(min_price) }}</label>
-<input id="min_price" name="min_price" type="range" min="{{ price_min }}" max="{{ price_max }}" step="1" value="{{ min_price }}">
-<label for="max_price">Maximum price: ₹{{ "{:,.0f}".format(max_price) }}</label>
-<input id="max_price" name="max_price" type="range" min="{{ price_min }}" max="{{ price_max }}" step="1" value="{{ max_price }}">
+<label for="min_price">Minimum price: <output id="min_price_label">₹{{ "{:,.0f}".format(min_price) }}</output></label>
+<input id="min_price" name="min_price" type="range" min="{{ price_min }}" max="{{ price_max }}" step="1" value="{{ min_price }}" aria-describedby="price_filter_help">
+<label for="max_price">Maximum price: <output id="max_price_label">₹{{ "{:,.0f}".format(max_price) }}</output></label>
+<input id="max_price" name="max_price" type="range" min="{{ price_min }}" max="{{ price_max }}" step="1" value="{{ max_price }}" aria-describedby="price_filter_help">
+<p id="price_filter_help" class="muted">Drag either slider to set the range, then select Search listings to apply it.</p>
 </div>
 <button type="submit">Search listings</button>
 
@@ -178,8 +179,9 @@ Check the latest official auction details, corrigenda and notices before acting.
 <span class="pill {{ item.status_class }}">{{ item.deadline_status }}</span>
 <div class="muted" style="margin-top:8px">{{ item.provenance_count }} collected observations for this ID</div>
 <div class="links">
+<a href="https://www.google.com/maps/search/?api=1&amp;query={{ (item.scheme ~ ', Jaipur, Rajasthan')|urlencode }}" target="_blank" rel="noopener noreferrer">Find scheme area on Google Maps ↗</a>
 {% for link in item.detail_links %}<a href="{{ link }}" target="_blank" rel="noopener">Official details{% if not loop.first %} (alternate){% endif %} ↗</a>{% endfor %}
-{% for link in item.listing_links %}<a href="{{ link }}" target="_blank" rel="noopener">Source listing ↗</a>{% endfor %}
+{% for link in item.listing_links %}<a href="{{ link }}" target="_blank" rel="noopener">{% if loop.first %}Official auction listing{% else %}Additional official listing{% endif %} ↗</a>{% endfor %}
 </div>
 <details class="raw"><summary>View original source row</summary><p>{{ item.raw_text }}</p></details>
 </article>
@@ -188,6 +190,45 @@ Check the latest official auction details, corrigenda and notices before acting.
 {% endfor %}
 </section></main>
 <footer>Jaipur Land Intelligence · Prototype · Verify current status through official sources.</footer>
+<script>
+(() => {
+  const minSlider = document.getElementById("min_price");
+  const maxSlider = document.getElementById("max_price");
+  const minLabel = document.getElementById("min_price_label");
+  const maxLabel = document.getElementById("max_price_label");
+  if (!minSlider || !maxSlider || !minLabel || !maxLabel) return;
+
+  const rupees = new Intl.NumberFormat("en-IN", {
+    maximumFractionDigits: 0,
+    useGrouping: true
+  });
+
+  function updateLabels(changedSlider) {
+    let minValue = Number(minSlider.value);
+    let maxValue = Number(maxSlider.value);
+
+    // Keep the range valid while allowing the handle being dragged to lead.
+    if (minValue > maxValue) {
+      if (changedSlider === minSlider) {
+        maxValue = minValue;
+        maxSlider.value = String(maxValue);
+      } else {
+        minValue = maxValue;
+        minSlider.value = String(minValue);
+      }
+    }
+
+    minLabel.textContent = "₹" + rupees.format(minValue);
+    maxLabel.textContent = "₹" + rupees.format(maxValue);
+    minSlider.setAttribute("aria-valuetext", "Minimum price ₹" + rupees.format(minValue));
+    maxSlider.setAttribute("aria-valuetext", "Maximum price ₹" + rupees.format(maxValue));
+  }
+
+  minSlider.addEventListener("input", () => updateLabels(minSlider));
+  maxSlider.addEventListener("input", () => updateLabels(maxSlider));
+  updateLabels(null);
+})();
+</script>
 </body></html>
 """
 
@@ -602,7 +643,11 @@ button{background:#173354;border-color:#173354;color:white;font-weight:bold}
 <span class="pill">{{ item.category_label }}</span><span class="pill {{ item.status_class }}">{{ item.deadline_status }}</span>
 <h3><a href="/property/{{ item.auction_id }}">{{ item.title }}</a></h3><div class="muted">{{ item.source_authority }} · Auction ID {{ item.auction_id }}</div>
 <div class="details"><div class="detail"><small>Scheme / industrial area</small><strong>{{ item.scheme }}</strong></div><div class="detail"><small>Property / plot</small><strong>{{ item.property_number }}</strong></div><div class="detail"><small>Area</small><strong>{{ item.area }}</strong></div><div class="detail"><small>Land use</small><strong>{{ item.usage }}</strong></div><div class="detail"><small>Reserve / assessed value</small><strong>{{ item.assessed_value }}</strong></div><div class="detail"><small>EMD</small><strong>{{ item.emd }}</strong></div><div class="detail"><small>Application / EMD dates</small><strong>{{ item.emd_start }} to {{ item.emd_end }}</strong></div><div class="detail"><small>Bid dates</small><strong>{{ item.bid_start }} to {{ item.bid_end }}</strong></div></div>
-<div class="links">{% for link in item.detail_links + item.listing_links %}<a href="{{ link }}" target="_blank" rel="noopener">Official source ↗</a>{% endfor %}</div>
+<div class="links">
+<a href="https://www.google.com/maps/search/?api=1&amp;query={{ (item.scheme ~ ', Jaipur, Rajasthan')|urlencode }}" target="_blank" rel="noopener noreferrer">Find scheme area on Google Maps ↗</a>
+{% for link in item.detail_links %}<a href="{{ link }}" target="_blank" rel="noopener">{% if loop.first %}Official property details{% else %}Alternate property details{% endif %} ↗</a>{% endfor %}
+{% for link in item.listing_links %}<a href="{{ link }}" target="_blank" rel="noopener">{% if loop.first %}Official auction listing{% else %}Additional official listing{% endif %} ↗</a>{% endfor %}
+</div>
 </article>{% else %}<div class="empty"><strong>No records available for this authority and filter.</strong><p class="muted">RIICO and other-authority records remain in staging until official identifiers and fields are reviewed.</p></div>{% endfor %}</section>
 </main></body></html>
 """
@@ -682,8 +727,29 @@ def load_scheme_location(scheme_name):
                 FROM scheme_labels AS sl
                 JOIN locations AS l ON l.scheme_label_id = sl.id
                 WHERE sl.normalized_label = ?
-                  AND l.status IN ('provisional', 'verified')
-                ORDER BY CASE l.status WHEN 'verified' THEN 0 ELSE 1 END, l.id
+                  AND l.status = 'verified'
+                  AND l.precision IN ('approximate scheme-area', 'scheme_area', 'scheme-level')
+                  AND l.source_url IS NOT NULL
+                  AND trim(l.source_url) <> ''
+                  AND l.evidence_notes IS NOT NULL
+                  AND lower(trim(l.evidence_notes)) LIKE '%verified%'
+                  AND (
+                      lower(l.evidence_notes) LIKE '%map%'
+                      OR lower(l.evidence_notes) LIKE '%place reference%'
+                  )
+                  AND l.coordinate_subject IS NOT NULL
+                  AND (
+                      lower(l.coordinate_subject) LIKE '%scheme%'
+                      OR lower(l.coordinate_subject) LIKE '%sector%'
+                      OR lower(l.coordinate_subject) LIKE '%area%'
+                  )
+                  AND l.verification_status IS NOT NULL
+                  AND lower(trim(l.verification_status)) LIKE '%verified%'
+                  AND lower(l.verification_status) NOT LIKE '%candidate%'
+                  AND lower(l.verification_status) NOT LIKE '%provisional%'
+                  AND l.confidence IS NOT NULL
+                  AND lower(trim(l.confidence)) LIKE 'high%'
+                ORDER BY l.id
                 LIMIT 1
                 """,
                 (normalized,),
@@ -737,15 +803,15 @@ h2{font-size:17px;color:var(--navy);margin:0 0 14px}.grid{display:grid;grid-temp
 </div></section>
 {% if item.map_location %}
 <section class="panel"><h2>Navigate to the scheme area</h2>
-<div class="notice"><strong>Location accuracy:</strong> This is a {{ item.map_location.precision }} pin for {{ item.map_location.coordinate_subject or "a reviewed location" }}. {% if item.map_location.precision == "locality_only" %}<strong>Locality navigation only:</strong> the actual scheme boundary and plot are unverified.{% else %}It is not the exact plot location, entrance, or legal boundary.{% endif %} Confirm the plot against the official location plan before visiting or making a decision.</div>
+<div class="notice"><strong>Approximate sector/scheme location only — this pin does not identify the exact property, plot boundary, entrance, or legal location.</strong> Confirm the property against the official location plan before visiting or making a decision.</div>
 <p><strong>{{ item.map_location.scheme_label }}</strong></p>
 <p class="muted">Verification status: {{ item.map_location.status }} / {{ item.map_location.verification_status or "not separately recorded" }} · Confidence: {{ item.map_location.confidence or "not recorded" }} · Coordinates: {{ "%.6f"|format(item.map_location.latitude) }}, {{ "%.6f"|format(item.map_location.longitude) }}</p>
 <div class="map-frame"><iframe title="Scheme-area map" loading="lazy" referrerpolicy="no-referrer-when-downgrade" src="https://maps.google.com/maps?q={{ item.map_location.latitude }},{{ item.map_location.longitude }}&z=14&output=embed" allowfullscreen></iframe></div>
-<div class="links"><a href="https://www.google.com/maps/dir/?api=1&destination={{ item.map_location.latitude }},{{ item.map_location.longitude }}" target="_blank" rel="noopener noreferrer">Get directions to scheme area ↗</a>{% if item.map_location.source_url %}<a href="{{ item.map_location.source_url }}" target="_blank" rel="noopener noreferrer">Open location source ↗</a>{% endif %}</div>
+<div class="links"><a href="https://www.google.com/maps/search/?api=1&query={{ item.map_location.latitude }},{{ item.map_location.longitude }}" target="_blank" rel="noopener noreferrer">Open approximate area in Google Maps ↗</a><a href="https://www.google.com/maps/dir/?api=1&destination={{ item.map_location.latitude }},{{ item.map_location.longitude }}" target="_blank" rel="noopener noreferrer">Get directions to approximate area ↗</a>{% if item.map_location.source_url %}<a href="{{ item.map_location.source_url }}" target="_blank" rel="noopener noreferrer">Open location source ↗</a>{% endif %}</div>
 <p class="muted">{{ item.map_location.evidence_notes }}</p>
 </section>
 {% else %}
-<section class="panel"><h2>Location</h2><p class="muted"><strong>Location not yet verified.</strong> No suitable reviewed scheme-area location record is available for this exact scheme label. We are not guessing coordinates from the scheme or plot name.</p></section>
+<section class="panel"><h2>Explore the scheme area on Google Maps</h2><p class="muted"><strong>Scheme / area from source:</strong> {{ item.scheme }}</p><p class="muted">This map searches for the recorded scheme name in Jaipur, Rajasthan. Google Maps may show a general area or several possible matches; this is not a verified pin for the exact plot.</p><div class="map-frame"><iframe title="Google Maps search for the recorded scheme area" loading="lazy" referrerpolicy="no-referrer-when-downgrade" src="https://maps.google.com/maps?q={{ (item.scheme ~ ', Jaipur, Rajasthan')|urlencode }}&z=12&output=embed" allowfullscreen></iframe></div><div class="links"><a href="https://www.google.com/maps/search/?api=1&amp;query={{ (item.scheme ~ ', Jaipur, Rajasthan')|urlencode }}" target="_blank" rel="noopener noreferrer">Open this area search in Google Maps ↗</a></div><p class="muted">An exact property pin will only be shown when a verified coordinate is available. Confirm the plot against the official location plan before visiting or making a decision.</p></section>
 {% endif %}
 <section class="panel"><h2>Official source records</h2><p class="muted">These links are preserved from collected records; they are not reconstructed by this page.</p>
 {% if item.detail_links or item.listing_links %}<div class="links">
