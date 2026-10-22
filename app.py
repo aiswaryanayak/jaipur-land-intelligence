@@ -1190,8 +1190,24 @@ button{background:var(--navy);border-color:var(--navy);color:white;font-weight:b
 .links{display:flex;flex-wrap:wrap;gap:12px;margin-top:12px}.links a{color:var(--blue);font-size:13px;font-weight:bold;overflow-wrap:anywhere}
 .history-table{width:100%;border-collapse:collapse;font-size:12px}.history-table th,.history-table td{text-align:left;border-bottom:1px solid #edf0f4;padding:8px}
 .chart{border:1px solid var(--line);border-radius:7px;padding:8px;margin:12px 0;overflow:hidden}.chart svg{display:block;width:100%;height:auto;min-height:240px}.chart circle{cursor:pointer;fill:#245b91;stroke:#fff;stroke-width:1.5}.chart .comparable-point{fill:#8a5a00}.chart .median-line{fill:none;stroke:#173354;stroke-width:2;stroke-dasharray:6 4}.axis-label{fill:var(--muted);font-size:10px}.chart-legend{font-size:12px;color:var(--muted);margin:4px 0 8px}
-.chat{display:grid;gap:10px}.chat-response{white-space:pre-wrap;background:#f7f9fc;padding:12px;border-radius:5px;font-size:13px;line-height:1.6}
-@media(max-width:650px){.grid,.inputs,.scenarios{grid-template-columns:1fr}}
+.assistant-shell{border:1px solid var(--line);border-radius:12px;background:#fbfcfe;overflow:hidden}
+.assistant-header{display:flex;align-items:center;gap:12px;padding:16px 18px;background:white;border-bottom:1px solid var(--line)}
+.assistant-icon{display:grid;place-items:center;width:36px;height:36px;flex:0 0 36px;border-radius:10px;background:#e8f0f8;color:var(--navy);font-size:20px}
+.assistant-title{margin:0;color:var(--navy);font-size:15px}.assistant-subtitle{margin:3px 0 0;color:var(--muted);font-size:12px}
+.chat-thread{display:grid;gap:12px;padding:18px;min-height:74px}
+.chat-bubble{max-width:88%;padding:11px 14px;border-radius:14px;font-size:13px;line-height:1.65;white-space:pre-wrap;overflow-wrap:anywhere}
+.chat-bubble.user{justify-self:end;background:var(--navy);color:white;border-bottom-right-radius:4px}
+.chat-bubble.assistant{justify-self:start;background:#eef3f8;color:var(--ink);border-bottom-left-radius:4px}
+.chat-bubble.error{justify-self:start;background:#fff6e5;border:1px solid #f0d28c;color:#684d13}
+.chat-label{display:block;margin-bottom:4px;font-size:10px;font-weight:bold;letter-spacing:.04em;text-transform:uppercase;opacity:.72}
+.chat-composer{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end;padding:14px 18px;background:white;border-top:1px solid var(--line)}
+.chat-composer label{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.chat-composer textarea{min-height:46px;max-height:150px;resize:vertical;padding:12px 13px;border-radius:9px;line-height:1.45}
+.chat-send{width:auto;min-width:78px;padding:11px 16px;border-radius:9px}
+.chat-composer textarea:focus-visible,.chat-send:focus-visible{outline:3px solid #8db7df;outline-offset:2px}
+.chat-send:disabled{cursor:wait;opacity:.7}.chat-status{padding:0 18px 13px;color:var(--muted);font-size:12px}
+.chat-status[hidden]{display:none}
+@media(max-width:650px){.grid,.inputs,.scenarios{grid-template-columns:1fr}.chat-composer{grid-template-columns:1fr}.chat-send{width:100%}.chat-bubble{max-width:94%}}
 </style></head><body>
 <header><h1>{{ item.title }}</h1><div class="subtitle">Property-specific investment analysis · estimates only</div></header>
 <main>
@@ -1239,12 +1255,55 @@ button{background:var(--navy);border-color:var(--navy);color:white;font-weight:b
 <label>Holding period (years, optional)<input name="holding_years" value="{{ inputs.holding_years or '' }}" inputmode="decimal"></label>
 <button type="submit">Calculate estimate scenarios</button></form>
 {% if scenarios %}<div class="scenarios">{% for scenario in scenarios %}<div class="scenario"><h3>{{ scenario.label }}</h3><p class="muted">{{ scenario.assumption }}</p><div class="detail"><small>Total invested cost</small><strong>₹{{ "{:,.2f}".format(scenario.total_cost) }}</strong></div><div class="detail"><small>Net profit</small><strong>₹{{ "{:,.2f}".format(scenario.net_profit) }}</strong></div><div class="detail"><small>ROI</small><strong>{{ "{:,.2f}".format(scenario.roi_percent) }}%</strong></div><div class="detail"><small>Annualized ROI</small><strong>{% if scenario.annualized_roi_percent is not none %}{{ "{:,.2f}".format(scenario.annualized_roi_percent) }}%{% else %}Not calculated{% endif %}</strong></div></div>{% endfor %}</div>{% endif %}</section>
-<section class="panel"><h2>Gemini research assistant</h2><p class="muted">Questions use this property's verified context plus matching local catalogue records. Optional official web research is disclosed when available. Gemini must distinguish sourced facts, calculations, assumptions, and unknowns.</p>
-{% if chat_error %}<div class="notice">{{ chat_error }}</div>{% endif %}{% if chat_response %}<div class="chat-response">{{ chat_response }}</div>{% endif %}
-<form method="post" action="/property/{{ item.auction_id }}/analysis/chat" class="chat"><textarea name="question" rows="4" maxlength="2000" required placeholder="Ask about this exact property..."></textarea><button type="submit">Ask about this property</button></form></section>
+<section class="panel"><div class="assistant-shell">
+<div class="assistant-header"><span class="assistant-icon" aria-hidden="true">✦</span><div><h2 class="assistant-title">Gemini Research Assistant</h2><p class="assistant-subtitle">Property insights powered by verified data.</p></div></div>
+<p class="muted" style="padding:0 18px;margin:16px 0 0">Questions use this property's verified context plus matching local catalogue records. Optional official web research is disclosed when available. Gemini must distinguish sourced facts, calculations, assumptions, and unknowns.</p>
+<div class="chat-thread" aria-live="polite">
+{% if chat_response %}<div class="chat-bubble assistant"><span class="chat-label">Gemini</span>{{ chat_response }}</div>{% endif %}
+{% if chat_error %}<div class="chat-bubble error"><span class="chat-label">Assistant notice</span>{{ chat_error }}</div>{% endif %}
+{% if not chat_response and not chat_error %}<p class="muted" style="margin:0">Ask a question about this property, its verified comparable records, or the information still requiring due diligence.</p>{% endif %}
+</div>
+<div class="chat-status" id="chat-status" role="status" aria-live="polite" hidden>Gemini is thinking…</div>
+<form method="post" action="/property/{{ item.auction_id }}/analysis/chat" class="chat-composer" id="chat-composer">
+<label for="chat-question">Your research question</label><textarea id="chat-question" name="question" rows="2" maxlength="2000" required placeholder="Ask a research question…" aria-describedby="chat-help"></textarea><button class="chat-send" type="submit">Send</button>
+</form><div id="chat-help" class="chat-status">Press Enter to send, or use Shift+Enter for a new line.</div>
+</div></section>
 </main><script>
 const history = {{ history|tojson }};
 const comparables = {{ comparables|tojson }};
+const chatComposer = document.getElementById("chat-composer");
+const chatQuestion = document.getElementById("chat-question");
+const chatStatus = document.getElementById("chat-status");
+if (chatComposer) {
+  chatComposer.addEventListener("submit", () => {
+    const thread = document.querySelector(".chat-thread");
+    const question = chatQuestion ? chatQuestion.value.trim() : "";
+    if (thread && question) {
+      const bubble = document.createElement("div");
+      bubble.className = "chat-bubble user";
+      bubble.innerHTML = '<span class="chat-label">You</span>';
+      bubble.appendChild(document.createTextNode(question));
+      thread.appendChild(bubble);
+    }
+    const sendButton = chatComposer.querySelector("button[type='submit']");
+    if (sendButton) {
+      sendButton.disabled = true;
+      sendButton.textContent = "Sending…";
+    }
+    if (chatStatus) {
+      chatStatus.hidden = false;
+      chatStatus.textContent = "Gemini is thinking…";
+    }
+  });
+}
+if (chatQuestion) {
+  chatQuestion.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      if (chatComposer && chatComposer.requestSubmit) chatComposer.requestSubmit();
+    }
+  });
+}
 document.querySelectorAll("[data-history-index]").forEach((point) => point.addEventListener("click", () => {
   const entry = history[Number(point.dataset.historyIndex)];
   document.getElementById("history-detail").innerHTML =
