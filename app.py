@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import sqlite3
+import statistics
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 
 import hmac
 import os
+import requests
 from flask import Flask, render_template_string, request, Response
 
 app = Flask(__name__)
@@ -36,6 +39,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_FILE = BASE_DIR / "deploy_data" / "auctions.json"
 AUTHORITY_DATA_FILE = BASE_DIR / "deploy_data" / "authority_records.json"
 LOCATION_DB_FILE = BASE_DIR / "data" / "jaipur_land_intelligence.sqlite3"
+POST_AUCTION_FILE = BASE_DIR / "data" / "jda_post_auction_latest.json"
 IST = timezone(timedelta(hours=5, minutes=30))
 
 PAGE = r"""
@@ -442,6 +446,347 @@ def numeric_price(value):
     match = re.search(r"\d[\d,]*(?:\.\d+)?", text(value))
     if not match:
         return None
+    return float(match.group(0).replace(",", ""))
+
+
+def _normalized_identity(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+
+def _area_number(value):
+    match = re.search(r"\d+(?:\.\d+)?", str(value or "").replace(",", ""))
+    return float(match.group(0)) if match else None
+
+
+def _analysis_date(value):
+    text_value = str(value or "").strip()
+    for fmt in ("%d/%m/%Y", "%d-%b-%Y %I:%M %p"):
+        try:
+            return datetime.strptime(text_value, fmt).replace(tzinfo=IST)
+        except ValueError:
+            continue
+    try:
+        parsed = datetime.fromisoformat(text_value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _https_url(value):
+    candidate = str(value or "").strip()
+    parsed = urlparse(candidate)
+    return candidate if parsed.scheme == "https" and parsed.netloc else ""
+
+
+def _analysis_observation(
+    date_value, amount, metric_type, unit, authority, source_url, identity_note,
+    source_record_id
+):
+    parsed_date = _analysis_date(date_value)
+    try:
+        numeric_amount = float(amount)
+    except (TypeError, ValueError):
+        numeric_amount = None
+    url = _https_url(source_url)
+    if parsed_date is None or numeric_amount is None or numeric_amount < 0 or not url:
+        return None
+    return {
+        "date": parsed_date.isoformat(),
+        "date_label": parsed_date.astimezone(IST).strftime("%d %b %Y"),
+        "amount": numeric_amount,
+        "amount_label": f"{numeric_amount:,.2f}",
+        "metric_type": metric_type,
+        "unit": unit,
+        "authority": authority,
+        "source_url": url,
+        "identity_note": identity_note,
+        "source_record_id": source_record_id,
+    }
+
+
+def load_property_history(auction_id, item):
+    """Return only dated, linked observations with conservative property identity."""
+    observations = []
+    current_scheme = _normalized_identity(item.get("scheme"))
+    current_plot = _normalized_identity(item.get("property_number"))
+    current_area = _area_number(item.get("area"))
+
+    if POST_AUCTION_FILE.exists() and item.get("source_authority") == "Jaipur Development Authority":
+        try:
+            payload = json.loads(POST_AUCTION_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            payload = []
+        if isinstance(payload, list):
+            for record in payload:
+                if not isinstance(record, dict):
+                    continue
+                if (
+                    _normalized_identity(record.get("scheme_name")) != current_scheme
+                    or _normalized_identity(record.get("plot_number")) != current_plot
+                    or current_area is None
+                    or record.get("area_sqm") is None
+                ):
+                    continue
+                try:
+                    historical_area = float(record["area_sqm"])
+                except (TypeError, ValueError):
+                    continue
+                if abs(historical_area - current_area) > 0.01:
+                    continue
+                observation = _analysis_observation(
+                    record.get("auction_date"),
+                    record.get("auctioned_rate_inr_per_sqm"),
+                    "auctioned rate",
+                    "INR per square metre",
+                    record.get("source_authority"),
+                    record.get("source_url"),
+                    "Matched by authority, scheme, plot number, and area.",
+                    record.get("record_fingerprint"),
+                )
+                if observation:
+                    observations.append(observation)
+
+    source_paths = []
+    snapshot = latest_snapshot_file()
+    if snapshot:
+        source_paths.append(snapshot)
+    elif DATA_FILE.exists():
+        source_paths.append(DATA_FILE)
+    for source_path in source_paths:
+        try:
+            payload = json.loads(source_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        records = payload.get("records", []) if isinstance(payload, dict) else payload
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict) or str(record.get("auction_id")) != str(auction_id):
+                continue
+            amount = numeric_price(record.get("assessed_value"))
+            detail_links = record.get("detail_links")
+            source_url = (
+                detail_links[0]
+                if isinstance(detail_links, list) and detail_links
+                else record.get("source_url")
+            )
+            observation = _analysis_observation(
+                record.get("retrieved_at_utc"),
+                amount,
+                "BSP / assessed value",
+                "INR total",
+                record.get("source_authority") or "Jaipur Development Authority",
+                source_url or record.get("source_url"),
+                "Matched by exact catalogue auction_id.",
+                record.get("raw_row_sha256")
+                or f"{auction_id}:{record.get('retrieved_at_utc')}",
+            )
+            if observation:
+                observations.append(observation)
+
+    unique = {
+        (
+            entry["source_record_id"],
+            entry["date"],
+            entry["metric_type"],
+            entry["unit"],
+        ): entry
+        for entry in observations
+    }
+    return sorted(unique.values(), key=lambda entry: entry["date"])
+
+
+COMPARABLE_LOCALITY_ALIASES = {
+    # UDH calls the current locality "TRANSPORT NAGAR YOJANA"; JDA's
+    # post-auction rows identify the same locality as Transport Nagar.
+    "transportnagaryojana": {
+        "transportnagar",
+        "transportnagarsikarroad",
+    },
+}
+
+
+def _comparable_zone(item):
+    if _normalized_identity(item.get("scheme")) == "transportnagaryojana":
+        return "zone13"
+    match = re.search(r"\bzone\s*[- ]?\s*(\d+)\b", str(item.get("zone_name", "")).casefold())
+    return f"zone{match.group(1)}" if match else ""
+
+
+def _record_zone(record):
+    match = re.search(
+        r"\bzone\s*[- ]?\s*(\d+)\b",
+        str(record.get("zone_name", "")).casefold(),
+    )
+    return f"zone{match.group(1)}" if match else ""
+
+
+def audit_comparable_auctions(item):
+    """Classify source rows before selecting same-locality comparables."""
+    if not POST_AUCTION_FILE.exists():
+        return {"included": [], "same_zone_unverified": 0, "excluded": 0}
+    try:
+        records = json.loads(POST_AUCTION_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {"included": [], "same_zone_unverified": 0, "excluded": 0}
+    if not isinstance(records, list):
+        return {"included": [], "same_zone_unverified": 0, "excluded": 0}
+
+    target_category = _normalized_identity(item.get("usage"))
+    target_area = _area_number(item.get("area"))
+    target_zone = _comparable_zone(item)
+    comparables = []
+    same_zone_unverified = 0
+    excluded = 0
+    for record in records:
+        if not isinstance(record, dict):
+            excluded += 1
+            continue
+        raw = record.get("raw_source_row")
+        raw_scheme = raw.get("scheme") if isinstance(raw, dict) else None
+        raw_zone = raw.get("zone_name") if isinstance(raw, dict) else None
+        source_zone = _record_zone(record)
+        if not source_zone:
+            excluded += 1
+            continue
+        if target_zone and source_zone != target_zone:
+            excluded += 1
+            continue
+        target_locality = _normalized_identity(item.get("scheme"))
+        accepted_localities = COMPARABLE_LOCALITY_ALIASES.get(
+            target_locality, {target_locality}
+        )
+        source_locality = _normalized_identity(record.get("scheme_name"))
+        if not source_locality:
+            same_zone_unverified += 1
+            continue
+        if source_locality not in accepted_localities:
+            excluded += 1
+            continue
+        if not _normalized_identity(raw_scheme) or not _record_zone({"zone_name": raw_zone}):
+            same_zone_unverified += 1
+            continue
+        if (
+            _normalized_identity(raw_scheme) not in accepted_localities
+            or _record_zone({"zone_name": raw_zone}) != source_zone
+        ):
+            excluded += 1
+            continue
+        source_url = _https_url(record.get("source_url"))
+        date = _analysis_date(record.get("auction_date"))
+        try:
+            amount = float(record.get("auctioned_rate_inr_per_sqm"))
+            area = float(record.get("area_sqm"))
+        except (TypeError, ValueError):
+            continue
+        if date is None or not source_url or amount <= 0 or area <= 0 or not raw_zone:
+            excluded += 1
+            continue
+        source_id = str(record.get("record_fingerprint") or "").strip()
+        if not source_id:
+            excluded += 1
+            continue
+        category = str(record.get("property_category") or "").strip()
+        comparables.append({
+            "date": date.isoformat(),
+            "date_label": date.astimezone(IST).strftime("%d %b %Y"),
+            "amount": amount,
+            "amount_label": f"{amount:,.2f}",
+            "plot_number": str(record.get("plot_number") or "").strip(),
+            "area_sqm": area,
+            "area_label": f"{area:,.2f} sqm",
+            "category": category or "Not stated",
+            "authority": str(record.get("source_authority") or "Jaipur Development Authority"),
+            "source_url": source_url,
+            "source_record_id": source_id,
+            "same_category": bool(target_category and
+                                  _normalized_identity(category) == target_category),
+            "area_difference": abs(area - target_area) if target_area is not None else None,
+        })
+
+    unique = {
+        (entry["source_record_id"], entry["date"]): entry
+        for entry in comparables
+    }
+    return {
+        "included": sorted(unique.values(), key=lambda entry: (entry["date"], entry["plot_number"])),
+        "same_zone_unverified": same_zone_unverified,
+        "excluded": excluded,
+    }
+
+
+def load_comparable_auctions(item):
+    return audit_comparable_auctions(item)["included"]
+
+
+def comparable_statistics(comparables):
+    amounts = sorted(entry["amount"] for entry in comparables)
+    if len(amounts) < 2:
+        return None
+    midpoint = len(amounts) // 2
+    median = amounts[midpoint] if len(amounts) % 2 else (
+        amounts[midpoint - 1] + amounts[midpoint]
+    ) / 2
+    return {
+        "count": len(amounts),
+        "minimum": min(amounts),
+        "median": median,
+        "maximum": max(amounts),
+    }
+
+
+def calculate_roi(acquisition_price, additional_costs, resale_value, holding_years=None):
+    values = (acquisition_price, additional_costs, resale_value)
+    if any(value is None or value < 0 for value in values):
+        return None
+    total_cost = acquisition_price + additional_costs
+    if total_cost <= 0:
+        return None
+    profit = resale_value - total_cost
+    result = {
+        "total_cost": total_cost,
+        "net_profit": profit,
+        "roi_percent": (profit / total_cost) * 100,
+        "annualized_roi_percent": None,
+    }
+    if holding_years is not None and holding_years > 0 and resale_value > 0:
+        result["annualized_roi_percent"] = (
+            ((resale_value / total_cost) ** (1 / holding_years) - 1) * 100
+        )
+    return result
+
+
+def _roi_input(form, name):
+    try:
+        value = float(form.get(name, "").replace(",", "").strip())
+        return value if value >= 0 else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def build_roi_scenarios(form):
+    acquisition = _roi_input(form, "acquisition_price")
+    additional = _roi_input(form, "additional_costs")
+    resale = _roi_input(form, "expected_resale_value")
+    years = _roi_input(form, "holding_years")
+    if acquisition is None or additional is None or resale is None:
+        return None, {"acquisition_price": acquisition, "additional_costs": additional,
+                      "expected_resale_value": resale, "holding_years": years}
+    scenarios = []
+    for label, multiplier, assumption in (
+        ("Pessimistic", 0.90, "90% of the user-entered resale assumption"),
+        ("Base", 1.00, "The user-entered resale assumption"),
+        ("Optimistic", 1.10, "110% of the user-entered resale assumption"),
+    ):
+        value = resale * multiplier
+        result = calculate_roi(acquisition, additional, value, years)
+        result["label"] = label
+        result["assumption"] = assumption
+        scenarios.append(result)
+    return scenarios, {"acquisition_price": acquisition, "additional_costs": additional,
+                       "expected_resale_value": resale, "holding_years": years}
     try:
         return float(match.group(0).replace(",", ""))
     except ValueError:
@@ -814,6 +1159,7 @@ h2{font-size:17px;color:var(--navy);margin:0 0 14px}.grid{display:grid;grid-temp
 <section class="panel"><h2>Explore the scheme area on Google Maps</h2><p class="muted"><strong>Scheme / area from source:</strong> {{ item.scheme }}</p><p class="muted">This map searches for the recorded scheme name in Jaipur, Rajasthan. Google Maps may show a general area or several possible matches; this is not a verified pin for the exact plot.</p><div class="map-frame"><iframe title="Google Maps search for the recorded scheme area" loading="lazy" referrerpolicy="no-referrer-when-downgrade" src="https://maps.google.com/maps?q={{ (item.scheme ~ ', Jaipur, Rajasthan')|urlencode }}&z=12&output=embed" allowfullscreen></iframe></div><div class="links"><a href="https://www.google.com/maps/search/?api=1&amp;query={{ (item.scheme ~ ', Jaipur, Rajasthan')|urlencode }}" target="_blank" rel="noopener noreferrer">Open this area search in Google Maps ↗</a></div><p class="muted">An exact property pin will only be shown when a verified coordinate is available. Confirm the plot against the official location plan before visiting or making a decision.</p></section>
 {% endif %}
 <section class="panel"><h2>Official source records</h2><p class="muted">These links are preserved from collected records; they are not reconstructed by this page.</p>
+<p><a href="/property/{{ item.auction_id }}/analysis">Open property-specific investment analysis ↗</a></p>
 {% if item.detail_links or item.listing_links %}<div class="links">
 {% for link in item.detail_links %}<a href="{{ link }}" target="_blank" rel="noopener noreferrer">{% if loop.first %}Official property details{% else %}Alternate property details{% endif %} ↗</a>{% endfor %}
 {% for link in item.listing_links %}<a href="{{ link }}" target="_blank" rel="noopener noreferrer">{% if loop.first %}Official auction listing{% else %}Alternate official listing{% endif %} ↗</a>{% endfor %}
@@ -823,16 +1169,314 @@ h2{font-size:17px;color:var(--navy);margin:0 0 14px}.grid{display:grid;grid-temp
 """
 
 
-@app.route("/property/<auction_id>")
-def property_detail(auction_id):
-    try:
-        items, _retrieved_at = load_catalogue()
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        return f"<h1>Could not load catalogue</h1><pre>{str(exc)}</pre>", 500
+ANALYSIS_PAGE = r"""
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Investment analysis · {{ item.title }}</title>
+<style>
+:root{--navy:#173354;--blue:#245b91;--ink:#263447;--muted:#64748b;--line:#dbe3ed;--bg:#f3f6fa}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Arial,Helvetica,sans-serif}
+header{background:var(--navy);color:white;padding:24px max(20px,calc((100% - 1000px)/2))}
+main{max-width:1000px;margin:25px auto;padding:0 18px 45px}.panel{background:white;border:1px solid var(--line);border-radius:9px;padding:22px;margin-bottom:16px}
+h1{font-size:23px;margin:0}.subtitle,.muted{font-size:13px;color:var(--muted);line-height:1.6}
+header .subtitle{color:#dbe6f3;margin-top:6px}h2{font-size:17px;color:var(--navy);margin:0 0 14px}
+.notice{background:#fff9e9;border-left:4px solid #e6b951;padding:13px 15px;font-size:13px;line-height:1.6;margin-bottom:16px}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 20px}.detail{border-top:1px solid #edf0f4;padding-top:9px}
+.detail small{display:block;color:var(--muted);font-size:11px;margin-bottom:5px}.detail strong{display:block;font-size:13px;overflow-wrap:anywhere}
+.inputs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}label{font-size:12px;color:var(--muted)}
+input,textarea,button{width:100%;font:inherit;padding:10px;border:1px solid #cbd5e1;border-radius:5px;background:white}
+button{background:var(--navy);border-color:var(--navy);color:white;font-weight:bold;cursor:pointer}.scenarios{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.scenario{border:1px solid var(--line);border-radius:7px;padding:13px}.scenario h3{color:var(--navy);margin:0 0 8px;font-size:15px}
+.links{display:flex;flex-wrap:wrap;gap:12px;margin-top:12px}.links a{color:var(--blue);font-size:13px;font-weight:bold;overflow-wrap:anywhere}
+.history-table{width:100%;border-collapse:collapse;font-size:12px}.history-table th,.history-table td{text-align:left;border-bottom:1px solid #edf0f4;padding:8px}
+.chart{border:1px solid var(--line);border-radius:7px;padding:8px;margin:12px 0;overflow:hidden}.chart svg{display:block;width:100%;height:auto;min-height:240px}.chart circle{cursor:pointer;fill:#245b91;stroke:#fff;stroke-width:1.5}.chart .comparable-point{fill:#8a5a00}.chart .median-line{fill:none;stroke:#173354;stroke-width:2;stroke-dasharray:6 4}.axis-label{fill:var(--muted);font-size:10px}.chart-legend{font-size:12px;color:var(--muted);margin:4px 0 8px}
+.chat{display:grid;gap:10px}.chat-response{white-space:pre-wrap;background:#f7f9fc;padding:12px;border-radius:5px;font-size:13px;line-height:1.6}
+@media(max-width:650px){.grid,.inputs,.scenarios{grid-template-columns:1fr}}
+</style></head><body>
+<header><h1>{{ item.title }}</h1><div class="subtitle">Property-specific investment analysis · estimates only</div></header>
+<main>
+<p><a href="/property/{{ item.auction_id }}">← Return to property details</a></p>
+<div class="notice"><strong>Important:</strong> This page reports sourced observations and user-entered scenarios. It is not financial, legal, valuation, or availability advice. No resale prediction is asserted.</div>
+<section class="panel"><h2>Property identity</h2><div class="grid">
+<div class="detail"><small>Auction ID</small><strong>{{ item.auction_id }}</strong></div>
+<div class="detail"><small>Authority</small><strong>{{ item.source_authority }}</strong></div>
+<div class="detail"><small>Scheme</small><strong>{{ item.scheme }}</strong></div>
+<div class="detail"><small>Property / plot</small><strong>{{ item.property_number }}</strong></div>
+</div><div class="links">{% for link in item.detail_links + item.listing_links %}<a href="{{ link }}" target="_blank" rel="noopener noreferrer">Official source ↗</a>{% endfor %}</div></section>
+<section class="panel"><h2>Verified dated price observations</h2>
+{% if not history %}<p class="muted">No verified property-specific historical observation is available. Records matched by scheme name alone are intentionally excluded.</p>
+{% else %}
+<p class="muted">Only observations with a dated source URL and conservative identity match are shown. Metrics and units are not interchangeable.</p>
+{% for series in chart_series %}<div class="chart"><strong>{{ series.unit }}</strong><svg viewBox="0 0 640 150" role="img" aria-label="Price observations in {{ series.unit }}">
+<polyline points="{{ series.polyline }}" fill="none" stroke="#245b91" stroke-width="2"/>
+{% for point in series.points %}<circle cx="{{ point.x }}" cy="{{ point.y }}" r="6" data-history-index="{{ point.index }}"><title>{{ point.date_label }} · {{ point.amount_label }} {{ point.unit }}</title></circle>{% endfor %}
+</svg></div>{% endfor %}
+<div id="history-detail" class="notice">Select a graph point to view its date, amount, metric, unit, authority, and source.</div>
+<table class="history-table"><thead><tr><th>Date</th><th>Metric</th><th>Amount</th><th>Source</th></tr></thead><tbody>
+{% for point in history %}<tr><td>{{ point.date_label }}</td><td>{{ point.metric_type }}</td><td>{{ point.amount_label }} {{ point.unit }}</td><td><a href="{{ point.source_url }}" target="_blank" rel="noopener noreferrer">Official source ↗</a></td></tr>{% endfor %}
+</tbody></table>{% endif %}</section>
+<section class="panel"><h2>Comparable Auction Rates</h2>
+<p class="muted">These are completed auction rates for other plots whose original JDA source row explicitly identifies the same locality. They are not historical prices for this property and do not establish physical distance or plot proximity. Rates are INR per square metre, sorted by auction date; category and area are shown for comparison.</p>
+<div class="notice"><strong>Source audit:</strong> {{ comparable_audit.same_zone_unverified }} same-zone record(s) were not included because their locality could not be verified from the original source row; {{ comparable_audit.excluded }} record(s) were excluded as unrelated or invalid. Only verified same-locality records are graphed and included in statistics.</div>
+{% if not comparables %}<p class="muted">No valid, dated, sourced comparable auction results are available for this scheme/area.</p>
+{% else %}
+{% for series in comparable_series %}<div class="chart"><strong>INR per square metre · {{ series.tier }}</strong><div class="chart-legend">● Individual auction · <span style="color:#173354">━ ━</span> Median rate by auction date{% if series.log_scale %} · Log-scaled visual axis; labels show actual rates{% endif %}</div><svg viewBox="0 0 700 250" role="img" aria-label="Comparable auction rates scatter plot">
+{% for tick in series.y_ticks %}<line x1="56" x2="680" y1="{{ tick.y }}" y2="{{ tick.y }}" stroke="#edf0f4"/><text x="2" y="{{ tick.y + 4 }}" class="axis-label">{{ tick.label }}</text>{% endfor %}
+<line x1="56" x2="680" y1="205" y2="205" stroke="#94a3b8"/><line x1="56" x2="56" y1="18" y2="205" stroke="#94a3b8"/>
+{% if series.median_line %}<polyline class="median-line" points="{% for point in series.median_line %}{{ point.x }},{{ point.y }} {% endfor %}"><title>Median auctioned rate grouped by auction date; not an individual auction price</title></polyline>{% endif %}
+{% for point in series.points %}<circle class="comparable-point" cx="{{ point.x }}" cy="{{ point.y }}" r="6" data-comparable-index="{{ point.index }}"><title>{{ point.date_label }} · {{ point.amount_label }} INR per square metre · Plot {{ point.plot_number }}</title></circle>{% endfor %}
+{% for tick in series.x_ticks %}<text x="{{ tick.x }}" y="225" text-anchor="middle" class="axis-label">{{ tick.label }}</text>{% endfor %}
+</svg></div>{% endfor %}
+<div id="comparable-detail" class="notice">Select a graph point to view the comparable plot, area, category, date, rate, authority, and source.</div>
+{% if comparable_stats %}<div class="grid"><div class="detail"><small>Sample count</small><strong>{{ comparable_stats.count }}</strong></div><div class="detail"><small>Minimum</small><strong>₹{{ "{:,.2f}".format(comparable_stats.minimum) }}/sqm</strong></div><div class="detail"><small>Median</small><strong>₹{{ "{:,.2f}".format(comparable_stats.median) }}/sqm</strong></div><div class="detail"><small>Maximum</small><strong>₹{{ "{:,.2f}".format(comparable_stats.maximum) }}/sqm</strong></div></div>{% else %}<p class="muted">Statistics require at least two valid comparable observations.</p>{% endif %}
+<table class="history-table"><thead><tr><th>Auction date</th><th>Plot</th><th>Area</th><th>Category</th><th>Auctioned rate</th><th>Source</th></tr></thead><tbody>
+{% for point in comparables %}<tr><td>{{ point.date_label }}</td><td>{{ point.plot_number }}</td><td>{{ point.area_label }}</td><td>{{ point.category }}</td><td>{{ point.amount_label }} INR/sqm</td><td><a href="{{ point.source_url }}" target="_blank" rel="noopener noreferrer">Official source ↗</a></td></tr>{% endfor %}
+</tbody></table>{% endif %}</section>
+<section class="panel"><h2>ROI scenario calculator</h2><p class="muted">Enter assumptions below. Total invested cost = acquisition price + additional costs. Net profit = expected resale value − total invested cost. ROI = net profit ÷ total invested cost. Annualized ROI uses compound annualization when holding period is positive.</p>
+<form method="post" class="inputs"><label>Acquisition price (INR)<input name="acquisition_price" value="{{ inputs.acquisition_price or '' }}" inputmode="decimal" required></label>
+<label>Additional costs (INR)<input name="additional_costs" value="{{ inputs.additional_costs or '' }}" inputmode="decimal" required></label>
+<label>Expected resale value (INR)<input name="expected_resale_value" value="{{ inputs.expected_resale_value or '' }}" inputmode="decimal" required></label>
+<label>Holding period (years, optional)<input name="holding_years" value="{{ inputs.holding_years or '' }}" inputmode="decimal"></label>
+<button type="submit">Calculate estimate scenarios</button></form>
+{% if scenarios %}<div class="scenarios">{% for scenario in scenarios %}<div class="scenario"><h3>{{ scenario.label }}</h3><p class="muted">{{ scenario.assumption }}</p><div class="detail"><small>Total invested cost</small><strong>₹{{ "{:,.2f}".format(scenario.total_cost) }}</strong></div><div class="detail"><small>Net profit</small><strong>₹{{ "{:,.2f}".format(scenario.net_profit) }}</strong></div><div class="detail"><small>ROI</small><strong>{{ "{:,.2f}".format(scenario.roi_percent) }}%</strong></div><div class="detail"><small>Annualized ROI</small><strong>{% if scenario.annualized_roi_percent is not none %}{{ "{:,.2f}".format(scenario.annualized_roi_percent) }}%{% else %}Not calculated{% endif %}</strong></div></div>{% endfor %}</div>{% endif %}</section>
+<section class="panel"><h2>Gemini research assistant</h2><p class="muted">Questions use this property's verified context plus matching local catalogue records. Optional official web research is disclosed when available. Gemini must distinguish sourced facts, calculations, assumptions, and unknowns.</p>
+{% if chat_error %}<div class="notice">{{ chat_error }}</div>{% endif %}{% if chat_response %}<div class="chat-response">{{ chat_response }}</div>{% endif %}
+<form method="post" action="/property/{{ item.auction_id }}/analysis/chat" class="chat"><textarea name="question" rows="4" maxlength="2000" required placeholder="Ask about this exact property..."></textarea><button type="submit">Ask about this property</button></form></section>
+</main><script>
+const history = {{ history|tojson }};
+const comparables = {{ comparables|tojson }};
+document.querySelectorAll("[data-history-index]").forEach((point) => point.addEventListener("click", () => {
+  const entry = history[Number(point.dataset.historyIndex)];
+  document.getElementById("history-detail").innerHTML =
+    "<strong>" + entry.date_label + "</strong> · " + entry.amount_label + " " + entry.unit +
+    " · " + entry.metric_type + " · " + entry.authority +
+    ' · <a target="_blank" rel="noopener noreferrer" href="' + entry.source_url + '">Original source ↗</a>';
+}));
+document.querySelectorAll("[data-comparable-index]").forEach((point) => point.addEventListener("click", () => {
+  const entry = comparables[Number(point.dataset.comparableIndex)];
+  document.getElementById("comparable-detail").innerHTML =
+    "<strong>" + entry.date_label + "</strong> · Plot " + entry.plot_number +
+    " · " + entry.area_label + " · " + entry.category + " · " +
+    entry.amount_label + " INR per square metre · " + entry.authority +
+    ' · <a target="_blank" rel="noopener noreferrer" href="' + entry.source_url + '">Original source ↗</a>';
+}));
+</script></body></html>
+"""
+
+
+def resolve_property(auction_id):
+    items, _retrieved_at = load_catalogue()
     item = next((entry for entry in items if entry["auction_id"] == str(auction_id)), None)
     if item is None:
         staged = load_authority_records("riico") + load_authority_records("rhb") + load_authority_records("jda")
         item = next((entry for entry in staged if entry["auction_id"] == str(auction_id)), None)
+    return item
+
+
+def _chart_series(history):
+    grouped = defaultdict(list)
+    for index, entry in enumerate(history):
+        grouped[entry["unit"]].append((index, entry))
+    result = []
+    for unit, entries in grouped.items():
+        amounts = [entry["amount"] for _, entry in entries]
+        low, high = min(amounts), max(amounts)
+        points = []
+        for position, (index, entry) in enumerate(entries):
+            x = 30 + (560 * position / max(1, len(entries) - 1))
+            ratio = 0.5 if high == low else (entry["amount"] - low) / (high - low)
+            y = 125 - (90 * ratio)
+            points.append({**entry, "index": index, "x": round(x, 2), "y": round(y, 2)})
+        result.append({"unit": unit, "points": points, "polyline": " ".join(
+            f"{point['x']},{point['y']}" for point in points
+        )})
+    return result
+
+
+def _comparable_chart_series(comparables):
+    if not comparables:
+        return []
+    chronological = sorted(comparables, key=lambda value: value["date"])
+    amounts = [entry["amount"] for entry in chronological]
+    low, high = min(amounts), max(amounts)
+    log_scale = low > 0 and high / low >= 4
+    visual_low = math.log(low) if log_scale else low
+    visual_high = math.log(high) if log_scale else high
+    dates = [datetime.fromisoformat(entry["date"]) for entry in chronological]
+    first_date, last_date = min(dates), max(dates)
+    date_span = max(1, (last_date - first_date).total_seconds())
+    points = []
+    occupied = defaultdict(int)
+    for index, entry in enumerate(chronological):
+        date = dates[index]
+        x = 56 + (624 * (date - first_date).total_seconds() / date_span)
+        visual_amount = math.log(entry["amount"]) if log_scale else entry["amount"]
+        ratio = 0.5 if visual_high == visual_low else (
+            (visual_amount - visual_low) / (visual_high - visual_low)
+        )
+        key = (round(x, 1), round(ratio, 3))
+        offset = occupied[key]
+        occupied[key] += 1
+        x += (offset - 0.5) * 10 if offset else 0
+        points.append({**entry, "index": index, "x": round(x, 2), "y": round(205 - (170 * ratio), 2)})
+    y_ticks = []
+    for fraction in (0, 0.25, 0.5, 0.75, 1):
+        visual_value = visual_low + ((visual_high - visual_low) * fraction)
+        value = math.exp(visual_value) if log_scale else visual_value
+        y_ticks.append({"y": round(205 - (170 * fraction), 2), "label": f"{value:,.0f}"})
+    tick_indexes = sorted(set([0, len(chronological) // 2, len(chronological) - 1]))
+    x_ticks = [
+        {"x": points[index]["x"], "label": dates[index].astimezone(IST).strftime("%d %b %y")}
+        for index in tick_indexes
+    ]
+    median_line = []
+    grouped = defaultdict(list)
+    for entry, date in zip(chronological, dates):
+        grouped[date.date()].append(entry["amount"])
+    if len(chronological) >= 3 and len(grouped) >= 2:
+        for group_date, group_amounts in sorted(grouped.items()):
+            group_datetime = datetime.combine(
+                group_date, datetime.min.time(), tzinfo=timezone.utc
+            )
+            x = 56 + (624 * (group_datetime - first_date).total_seconds() / date_span)
+            median_amount = statistics.median(group_amounts)
+            visual_amount = math.log(median_amount) if log_scale else median_amount
+            ratio = (
+                (visual_amount - visual_low) / (visual_high - visual_low)
+                if visual_high != visual_low else 0.5
+            )
+            median_line.append({
+                "x": round(x, 2),
+                "y": round(205 - (170 * ratio), 2),
+            })
+    return [{"points": points, "x_ticks": x_ticks, "y_ticks": y_ticks,
+             "median_line": median_line, "log_scale": log_scale,
+             "tier": "Verified same locality"}]
+
+
+def _catalogue_matches(question, limit=12):
+    try:
+        items, retrieved_at = load_catalogue()
+    except (OSError, ValueError, json.JSONDecodeError):
+        return [], "Catalogue unavailable"
+    words = {
+        word for word in re.findall(r"[a-z0-9]+", question.casefold())
+        if len(word) > 2
+    }
+    scored = []
+    for item in items:
+        haystack = " ".join(
+            str(item.get(key, "")) for key in
+            ("auction_id", "title", "scheme", "property_number", "area", "usage")
+        ).casefold()
+        score = sum(word in haystack for word in words)
+        if score:
+            scored.append((score, item))
+    scored.sort(key=lambda value: (-value[0], value[1]["auction_id"]))
+    return scored[:limit], retrieved_at
+
+
+def _official_web_research(question):
+    if os.environ.get("GEMINI_WEB_RESEARCH", "").strip().lower() not in {"1", "true", "yes"}:
+        return [], "Live web research is not enabled; using local verified data only."
+    sources = [
+        "https://jdaservice.rajasthan.gov.in/jdamicroportalproject/NoticeBoard/PostAuction",
+        "https://udhonline.rajasthan.gov.in/Portal/AuctionListNew",
+    ]
+    evidence = []
+    for url in sources:
+        try:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            text_content = re.sub(r"\s+", " ", response.text)
+            evidence.append({
+                "url": url,
+                "retrieved_at": datetime.now(timezone.utc).isoformat(),
+                "content": text_content[:12000],
+            })
+        except requests.RequestException:
+            continue
+    if not evidence:
+        return [], "Live official web research was unavailable; no web search is claimed."
+    return evidence, "Official web pages retrieved server-side for this request."
+
+
+def _gemini_answer(item, history, comparables, scenarios, inputs, question):
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return None, "Gemini assistant is not configured. Set GEMINI_API_KEY on the server."
+    if not question or len(question) > 2000:
+        return None, "Please provide a question of at most 2,000 characters."
+    matches, catalogue_retrieved_at = _catalogue_matches(question)
+    web_evidence, web_status = _official_web_research(question)
+    context = {
+        "property": {
+            key: item.get(key)
+            for key in ("auction_id", "title", "scheme", "property_number", "area",
+                        "usage", "assessed_value", "source_authority")
+        },
+        "official_links": list(dict.fromkeys(item.get("detail_links", []) + item.get("listing_links", []))),
+        "verified_observations": history,
+        "verified_comparable_auctions_other_properties": comparables,
+        "roi_inputs": inputs,
+        "roi_scenarios": scenarios or [],
+        "catalogue_matches": [
+            {
+                key: match[1].get(key)
+                for key in ("auction_id", "title", "scheme", "property_number",
+                            "area", "usage", "assessed_value", "detail_links",
+                            "source_authority")
+            }
+            for match in matches
+        ],
+        "catalogue_retrieved_at": catalogue_retrieved_at,
+        "web_research_status": web_status,
+        "official_web_evidence": web_evidence,
+    }
+    prompt = (
+        "Answer about the user's question using only the supplied context. "
+        "Distinguish sourced facts, calculated results, user assumptions, and unknowns. "
+        "Comparable auctions are other properties, not this property's history. "
+        "Never invent historical prices, citations, availability, distances, or legal/financial advice. "
+        "Do not claim web research unless official_web_evidence is non-empty. "
+        "Mention official links when relevant and explain missing evidence. Context:\n"
+        + json.dumps(context, ensure_ascii=False)
+        + "\nQuestion:\n" + question
+    )
+    endpoint = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-2.0-flash:generateContent"
+    )
+    try:
+        response = requests.post(
+            endpoint, params={"key": api_key},
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        candidates = payload.get("candidates") if isinstance(payload, dict) else None
+        if not isinstance(candidates, list) or not candidates:
+            raise ValueError("Gemini response has no candidates")
+        candidate = candidates[0]
+        content = candidate.get("content") if isinstance(candidate, dict) else None
+        parts = content.get("parts") if isinstance(content, dict) else None
+        if not isinstance(parts, list) or not parts:
+            raise ValueError("Gemini response has no content parts")
+        answer = parts[0].get("text") if isinstance(parts[0], dict) else None
+        if not isinstance(answer, str) or not answer.strip():
+            raise ValueError("Gemini response has no answer text")
+        return answer.strip()[:8000], None
+    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError):
+        return None, "Gemini could not answer this request right now. Sourced property data remains available above."
+
+
+@app.route("/property/<auction_id>")
+def property_detail(auction_id):
+    try:
+        item = resolve_property(auction_id)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return f"<h1>Could not load catalogue</h1><pre>{str(exc)}</pre>", 500
     if item is None:
         return "<h1>Property record not found</h1><p>This auction ID is not in the current catalogue.</p><p><a href='/'>Back to listings</a></p>", 404
 
@@ -845,6 +1489,49 @@ def property_detail(auction_id):
         from urllib.parse import urlencode
         back_url += "?" + urlencode(request.args)
     return render_template_string(DETAIL_PAGE, item=item, back_url=back_url)
+
+
+@app.route("/property/<auction_id>/analysis", methods=["GET", "POST"])
+def property_analysis(auction_id):
+    try:
+        item = resolve_property(auction_id)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return f"<h1>Could not load property</h1><pre>{str(exc)}</pre>", 500
+    if item is None:
+        return "<h1>Property record not found</h1><p><a href='/'>Back to property listings</a></p>", 404
+    history = load_property_history(auction_id, item)
+    comparable_audit = audit_comparable_auctions(item)
+    comparables = comparable_audit["included"]
+    scenarios, inputs = build_roi_scenarios(request.form if request.method == "POST" else {})
+    return render_template_string(
+        ANALYSIS_PAGE, item=item, history=history, chart_series=_chart_series(history),
+        comparables=comparables, comparable_series=_comparable_chart_series(comparables),
+        comparable_stats=comparable_statistics(comparables), comparable_audit=comparable_audit,
+        scenarios=scenarios, inputs=inputs, chat_response=None, chat_error=None,
+    )
+
+
+@app.route("/property/<auction_id>/analysis/chat", methods=["POST"])
+def property_analysis_chat(auction_id):
+    try:
+        item = resolve_property(auction_id)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return f"<h1>Could not load property</h1><pre>{str(exc)}</pre>", 500
+    if item is None:
+        return "<h1>Property record not found</h1><p><a href='/'>Back to property listings</a></p>", 404
+    history = load_property_history(auction_id, item)
+    comparable_audit = audit_comparable_auctions(item)
+    comparables = comparable_audit["included"]
+    scenarios, inputs = build_roi_scenarios(request.form)
+    answer, error = _gemini_answer(
+        item, history, comparables, scenarios, inputs, request.form.get("question", "").strip()
+    )
+    return render_template_string(
+        ANALYSIS_PAGE, item=item, history=history, chart_series=_chart_series(history),
+        comparables=comparables, comparable_series=_comparable_chart_series(comparables),
+        comparable_stats=comparable_statistics(comparables), comparable_audit=comparable_audit,
+        scenarios=scenarios, inputs=inputs, chat_response=answer, chat_error=error,
+    )
 
 
 
