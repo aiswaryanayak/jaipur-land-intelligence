@@ -1194,7 +1194,7 @@ button{background:var(--navy);border-color:var(--navy);color:white;font-weight:b
 .assistant-header{display:flex;align-items:center;gap:12px;padding:16px 18px;background:white;border-bottom:1px solid var(--line)}
 .assistant-icon{display:grid;place-items:center;width:36px;height:36px;flex:0 0 36px;border-radius:10px;background:#e8f0f8;color:var(--navy);font-size:20px}
 .assistant-title{margin:0;color:var(--navy);font-size:15px}.assistant-subtitle{margin:3px 0 0;color:var(--muted);font-size:12px}
-.chat-thread{display:grid;gap:12px;padding:18px;min-height:74px}
+.chat-thread{display:grid;gap:12px;padding:18px;min-height:74px;max-height:520px;overflow-y:auto;scroll-behavior:smooth}
 .chat-bubble{max-width:88%;padding:11px 14px;border-radius:14px;font-size:13px;line-height:1.65;white-space:pre-wrap;overflow-wrap:anywhere}
 .chat-bubble.user{justify-self:end;background:var(--navy);color:white;border-bottom-right-radius:4px}
 .chat-bubble.assistant{justify-self:start;background:#eef3f8;color:var(--ink);border-bottom-left-radius:4px}
@@ -1259,7 +1259,7 @@ button{background:var(--navy);border-color:var(--navy);color:white;font-weight:b
 <div class="assistant-header"><span class="assistant-icon" aria-hidden="true">✦</span><div><h2 class="assistant-title">Gemini Research Assistant</h2><p class="assistant-subtitle">Property insights powered by verified data.</p></div></div>
 <p class="muted" style="padding:0 18px;margin:16px 0 0">Questions use this property's verified context plus matching local catalogue records. Optional official web research is disclosed when available. Gemini must distinguish sourced facts, calculations, assumptions, and unknowns.</p>
 <div class="chat-thread" aria-live="polite">
-{% if chat_response %}<div class="chat-bubble assistant"><span class="chat-label">Gemini</span>{{ chat_response }}</div>{% endif %}
+{% if chat_response %}<div class="chat-bubble assistant"><span class="chat-label">Gemini</span><div class="assistant-content">{{ chat_response }}</div></div>{% endif %}
 {% if chat_error %}<div class="chat-bubble error"><span class="chat-label">Assistant notice</span>{{ chat_error }}</div>{% endif %}
 {% if not chat_response and not chat_error %}<p class="muted" style="margin:0">Ask a question about this property, its verified comparable records, or the information still requiring due diligence.</p>{% endif %}
 </div>
@@ -1275,17 +1275,139 @@ const chatComposer = document.getElementById("chat-composer");
 const chatQuestion = document.getElementById("chat-question");
 const chatStatus = document.getElementById("chat-status");
 if (chatComposer) {
-  chatComposer.addEventListener("submit", () => {
+  const thread = document.querySelector(".chat-thread");
+  const sendButton = chatComposer.querySelector("button[type='submit']");
+  const defaultError = "Gemini could not answer this request right now. Sourced property data remains available above.";
+
+  const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (character) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[character]));
+  const safeUrl = (value) => {
+    try {
+      const url = new URL(value, window.location.href);
+      return ["http:", "https:"].includes(url.protocol) ? url.href : null;
+    } catch (error) {
+      return null;
+    }
+  };
+  const inlineMarkdown = (value) => {
+    let html = escapeHtml(value);
+    const links = [];
+    const keepLink = (label, url) => {
+      const safe = safeUrl(url);
+      if (!safe) return label;
+      const token = "\u0000LINK" + links.length + "\u0000";
+      links.push('<a href="' + escapeHtml(safe) + '" target="_blank" rel="noopener noreferrer">' +
+        label + " ↗</a>");
+      return token;
+    };
+    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (match, label, url) => {
+      return keepLink(label, url);
+    });
+    html = html.replace(/(https?:\/\/[^\s<]+)/g, (match) => {
+      return keepLink(match, match);
+    });
+    html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    html = html.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+    return html.replace(/\u0000LINK(\d+)\u0000/g, (match, index) => links[Number(index)]);
+  };
+  const jsonText = (value) => {
+    const parsed = JSON.parse(value);
+    if (typeof parsed === "string") return parsed;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const preferred = ["answer", "response", "summary", "message", "text"];
+      const preferredValue = preferred.find((key) => typeof parsed[key] === "string");
+      if (preferredValue) return parsed[preferredValue];
+    }
+    const lines = [];
+    const visit = (entry, prefix) => {
+      if (entry === null || typeof entry !== "object") {
+        lines.push((prefix ? prefix + ": " : "") + String(entry));
+        return;
+      }
+      Object.entries(entry).forEach(([key, child]) => {
+        const label = prefix ? prefix + " · " + key : key;
+        if (child && typeof child === "object") visit(child, label);
+        else lines.push(label + ": " + String(child));
+      });
+    };
+    visit(parsed, "");
+    return lines.join("\n");
+  };
+  const readableText = (value) => {
+    const trimmed = String(value || "").trim();
+    if (!trimmed) return "";
+    if ((trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+        (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+      try {
+        return jsonText(trimmed);
+      } catch (error) {
+        return trimmed;
+      }
+    }
+    return trimmed;
+  };
+  const markdownHtml = (value) => {
+    const lines = readableText(value).split(/\r?\n/);
+    const output = [];
+    let list = null;
+    const closeList = () => {
+      if (list) {
+        output.push("</" + list + ">");
+        list = null;
+      }
+    };
+    lines.forEach((line) => {
+      const heading = line.match(/^\s{0,3}(#{1,3})\s+(.+)$/);
+      const unordered = line.match(/^\s*[-*]\s+(.+)$/);
+      const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+      if (heading) {
+        closeList();
+        output.push("<h" + heading[1].length + ">" + inlineMarkdown(heading[2]) + "</h" + heading[1].length + ">");
+      } else if (unordered || ordered) {
+        const type = unordered ? "ul" : "ol";
+        if (list !== type) {
+          closeList();
+          list = type;
+          output.push("<" + list + ">");
+        }
+        output.push("<li>" + inlineMarkdown((unordered || ordered)[1]) + "</li>");
+      } else if (line.trim()) {
+        closeList();
+        output.push("<p>" + inlineMarkdown(line) + "</p>");
+      } else {
+        closeList();
+      }
+    });
+    closeList();
+    return output.join("");
+  };
+  const renderAssistant = (bubble) => {
+    const content = bubble.querySelector(".assistant-content");
+    if (content) content.innerHTML = markdownHtml(content.textContent);
+  };
+  document.querySelectorAll(".chat-bubble.assistant").forEach(renderAssistant);
+
+  chatComposer.addEventListener("submit", async (event) => {
     const thread = document.querySelector(".chat-thread");
     const question = chatQuestion ? chatQuestion.value.trim() : "";
-    if (thread && question) {
+    if (!question || chatComposer.dataset.busy === "true") {
+      event.preventDefault();
+      return;
+    }
+    event.preventDefault();
+    chatComposer.dataset.busy = "true";
+    if (thread) {
       const bubble = document.createElement("div");
       bubble.className = "chat-bubble user";
-      bubble.innerHTML = '<span class="chat-label">You</span>';
+      const label = document.createElement("span");
+      label.className = "chat-label";
+      label.textContent = "You";
+      bubble.appendChild(label);
       bubble.appendChild(document.createTextNode(question));
       thread.appendChild(bubble);
+      thread.scrollTop = thread.scrollHeight;
     }
-    const sendButton = chatComposer.querySelector("button[type='submit']");
     if (sendButton) {
       sendButton.disabled = true;
       sendButton.textContent = "Sending…";
@@ -1293,6 +1415,39 @@ if (chatComposer) {
     if (chatStatus) {
       chatStatus.hidden = false;
       chatStatus.textContent = "Gemini is thinking…";
+    }
+    try {
+      const response = await fetch(chatComposer.action, {
+        method: "POST",
+        body: new FormData(chatComposer),
+        credentials: "same-origin",
+        headers: {"X-Requested-With": "XMLHttpRequest"}
+      });
+      if (!response.ok) throw new Error("Chat request failed");
+      const html = await response.text();
+      const parsedPage = new DOMParser().parseFromString(html, "text/html");
+      const result = parsedPage.querySelector(".chat-bubble.assistant, .chat-bubble.error");
+      if (!result) throw new Error("Chat response was empty");
+      const rendered = result.cloneNode(true);
+      if (rendered.classList.contains("assistant")) renderAssistant(rendered);
+      if (thread) {
+        const placeholder = thread.querySelector(".muted");
+        if (placeholder) placeholder.remove();
+        thread.appendChild(rendered);
+        thread.scrollTop = thread.scrollHeight;
+      }
+      if (chatQuestion) chatQuestion.value = "";
+      if (chatStatus) chatStatus.hidden = true;
+    } catch (error) {
+      chatComposer.dataset.busy = "false";
+      if (chatStatus) chatStatus.textContent = defaultError;
+      chatComposer.submit();
+      return;
+    }
+    chatComposer.dataset.busy = "false";
+    if (sendButton) {
+      sendButton.disabled = false;
+      sendButton.textContent = "Send";
     }
   });
 }
