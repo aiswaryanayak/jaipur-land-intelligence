@@ -356,6 +356,64 @@ class PropertyAnalysisTests(unittest.TestCase):
         self.assertEqual(audit["included"], [])
         self.assertEqual(audit["excluded"], 1)
 
+    def test_transport_catalogue_phase_alias_accepts_official_locality_rows(self):
+        item = property_item("T-A2")
+        item.update({
+            "scheme": "TRANSPORT NAGAR YOJANA - A2",
+            "zone_name": "Zone 13",
+        })
+        record = {
+            "source_authority": "Jaipur Development Authority",
+            "source_url": "https://jdaservice.rajasthan.gov.in/jdamicroportalproject/NoticeBoard/PostAuction",
+            "zone_name": "Deputy Commissioner (Zone 13)",
+            "scheme_name": "Transport Nagar",
+            "plot_number": "A3/406",
+            "property_category": "Commercial",
+            "area_sqm": 1611,
+            "auction_date": "24/08/2026",
+            "auctioned_rate_inr_per_sqm": 48100,
+            "record_fingerprint": "transport-phase-match",
+            "raw_source_row": {
+                "zone_name": "Deputy Commissioner (Zone 13)",
+                "scheme": "Transport Nagar",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "transport-phase.json"
+            path.write_text(json.dumps([record]), encoding="utf-8")
+            with patch.object(app, "POST_AUCTION_FILE", path):
+                audit = app.audit_comparable_auctions(item)
+        self.assertEqual([entry["plot_number"] for entry in audit["included"]], ["A3/406"])
+
+    def test_comparable_audit_rejects_missing_dates_and_invalid_amounts(self):
+        item = property_item("T-2")
+        item.update({"scheme": "TRANSPORT NAGAR YOJANA", "zone_name": "Zone 13"})
+        base = {
+            "source_authority": "Jaipur Development Authority",
+            "source_url": "https://jdaservice.rajasthan.gov.in/post-auction",
+            "zone_name": "Deputy Commissioner (Zone 13)",
+            "scheme_name": "Transport Nagar",
+            "property_category": "Commercial",
+            "area_sqm": 496,
+            "raw_source_row": {
+                "zone_name": "Deputy Commissioner (Zone 13)",
+                "scheme": "Transport Nagar",
+            },
+        }
+        records = [
+            {**base, "plot_number": "no-date", "auction_date": "",
+             "auctioned_rate_inr_per_sqm": 80000, "record_fingerprint": "no-date"},
+            {**base, "plot_number": "bad-rate", "auction_date": "10/10/2025",
+             "auctioned_rate_inr_per_sqm": 0, "record_fingerprint": "bad-rate"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid-comparables.json"
+            path.write_text(json.dumps(records), encoding="utf-8")
+            with patch.object(app, "POST_AUCTION_FILE", path):
+                audit = app.audit_comparable_auctions(item)
+        self.assertEqual(audit["included"], [])
+        self.assertEqual(audit["excluded"], 2)
+
     def test_comparable_chart_is_unconnected_readable_scatter(self):
         entries = [
             {
@@ -502,6 +560,29 @@ class PropertyAnalysisTests(unittest.TestCase):
             "https://generativelanguage.googleapis.com/v1beta/models/"
             "gemini-2.5-flash-lite:generateContent",
         )
+
+    def test_gemini_profitability_prompt_uses_roi_guidance_and_missing_inputs(self):
+        fake_response = type("Response", (), {
+            "raise_for_status": lambda self: None,
+            "json": lambda self: {
+                "candidates": [{"content": {"parts": [{"text": "grounded answer"}]}}]
+            },
+        })()
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=True), \
+                patch.object(app, "_catalogue_matches", return_value=([], "timestamp")), \
+                patch.object(app.requests, "post", return_value=fake_response) as post:
+            answer, error = app._gemini_answer(
+                property_item(), [], [], None,
+                {"acquisition_price": 12000000, "additional_costs": 500000,
+                 "expected_resale_value": None, "holding_years": None},
+                "Is this property potentially profitable?"
+            )
+        self.assertEqual(answer, "grounded answer")
+        self.assertIsNone(error)
+        prompt = post.call_args.kwargs["json"]["contents"][0]["parts"][0]["text"]
+        self.assertIn("expected resale value", prompt)
+        self.assertIn("Do not answer with a disclaimer alone", prompt)
+        self.assertIn("conditional evidence-based conclusion", prompt)
 
     def test_gemini_model_configuration_rejects_invalid_path(self):
         with patch.dict(

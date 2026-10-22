@@ -605,11 +605,26 @@ COMPARABLE_LOCALITY_ALIASES = {
         "transportnagar",
         "transportnagarsikarroad",
     },
+    # Current catalogue records use phase labels such as "- A" and "- A2"
+    # for the same Transport Nagar locality named by the JDA result rows.
+    "transportnagaryojanaa": {
+        "transportnagar",
+        "transportnagarsikarroad",
+    },
+    "transportnagaryojanaa2": {
+        "transportnagar",
+        "transportnagarsikarroad",
+    },
 }
 
 
+def _comparable_localities(value):
+    normalized = _normalized_identity(value)
+    return COMPARABLE_LOCALITY_ALIASES.get(normalized, {normalized})
+
+
 def _comparable_zone(item):
-    if _normalized_identity(item.get("scheme")) == "transportnagaryojana":
+    if _normalized_identity(item.get("scheme")).startswith("transportnagaryojana"):
         return "zone13"
     match = re.search(r"\bzone\s*[- ]?\s*(\d+)\b", str(item.get("zone_name", "")).casefold())
     return f"zone{match.group(1)}" if match else ""
@@ -654,10 +669,7 @@ def audit_comparable_auctions(item):
         if target_zone and source_zone != target_zone:
             excluded += 1
             continue
-        target_locality = _normalized_identity(item.get("scheme"))
-        accepted_localities = COMPARABLE_LOCALITY_ALIASES.get(
-            target_locality, {target_locality}
-        )
+        accepted_localities = _comparable_localities(item.get("scheme"))
         source_locality = _normalized_identity(record.get("scheme_name"))
         if not source_locality:
             same_zone_unverified += 1
@@ -680,6 +692,7 @@ def audit_comparable_auctions(item):
             amount = float(record.get("auctioned_rate_inr_per_sqm"))
             area = float(record.get("area_sqm"))
         except (TypeError, ValueError):
+            excluded += 1
             continue
         if date is None or not source_url or amount <= 0 or area <= 0 or not raw_zone:
             excluded += 1
@@ -758,6 +771,25 @@ def calculate_roi(acquisition_price, additional_costs, resale_value, holding_yea
     return result
 
 
+def format_inr(value, decimals=2):
+    if value is None:
+        return "Not available"
+    formatted = f"{float(value):,.{decimals}f}"
+    whole, separator, fraction = formatted.partition(".")
+    if len(whole) > 3:
+        tail = whole[-3:]
+        head = whole[:-3]
+        groups = []
+        while head:
+            groups.insert(0, head[-2:])
+            head = head[:-2]
+        whole = ",".join(groups + [tail])
+    return whole + (separator + fraction if decimals else "")
+
+
+app.jinja_env.globals["format_inr"] = format_inr
+
+
 def _roi_input(form, name):
     try:
         value = float(form.get(name, "").replace(",", "").strip())
@@ -766,27 +798,68 @@ def _roi_input(form, name):
         return None
 
 
-def build_roi_scenarios(form):
+def build_roi_scenarios(form, property_item=None):
     acquisition = _roi_input(form, "acquisition_price")
     additional = _roi_input(form, "additional_costs")
     resale = _roi_input(form, "expected_resale_value")
     years = _roi_input(form, "holding_years")
+    area = _roi_input(form, "area_sqm")
+    source_price = property_item.get("_price") if property_item else None
+    roi_fields = (
+        "acquisition_price", "additional_costs", "expected_resale_value",
+        "holding_years", "area_sqm",
+    )
+    if acquisition is None and "acquisition_price" not in form and source_price is not None:
+        acquisition = source_price
+    if additional is None and "additional_costs" not in form:
+        additional = 0.0
+    if area is None and property_item:
+        area = _area_number(property_item.get("area"))
+    price_per_sqm = acquisition / area if acquisition is not None and area and area > 0 else None
+    source_links = []
+    if property_item:
+        source_links = property_item.get("detail_links", []) + property_item.get("listing_links", [])
+    inputs = {
+        "acquisition_price": acquisition,
+        "additional_costs": additional,
+        "expected_resale_value": resale,
+        "holding_years": years,
+        "area_sqm": area,
+        "price_per_sqm": price_per_sqm,
+        "price_basis": (
+            "Verified source-listed assessed value / BSP; not a confirmed final auction price."
+            if source_price is not None else "No verified assessed or auction value is available."
+        ),
+        "source_links": list(dict.fromkeys(source_links)),
+    }
+    if form and any(name in form for name in roi_fields):
+        invalid = any(
+            form.get(name, "").strip() and _roi_input(form, name) is None
+            for name in roi_fields
+        )
+        missing = any(
+            name in form and not form.get(name, "").strip()
+            for name in ("acquisition_price", "additional_costs", "expected_resale_value")
+        )
+        if invalid:
+            inputs["validation_error"] = "Please enter zero or a valid non-negative number in each filled field."
+        elif missing:
+            inputs["validation_error"] = "Enter acquisition price, additional costs, and expected resale value to calculate scenarios."
     if acquisition is None or additional is None or resale is None:
-        return None, {"acquisition_price": acquisition, "additional_costs": additional,
-                      "expected_resale_value": resale, "holding_years": years}
+        return None, inputs
     scenarios = []
     for label, multiplier, assumption in (
-        ("Pessimistic", 0.90, "90% of the user-entered resale assumption"),
-        ("Base", 1.00, "The user-entered resale assumption"),
-        ("Optimistic", 1.10, "110% of the user-entered resale assumption"),
+        ("Conservative", 0.90, "90% of the user-entered resale assumption; estimate only"),
+        ("Base", 1.00, "The user-entered resale assumption; estimate only"),
+        ("Optimistic", 1.10, "110% of the user-entered resale assumption; estimate only"),
     ):
         value = resale * multiplier
         result = calculate_roi(acquisition, additional, value, years)
         result["label"] = label
+        result["resale_value"] = value
         result["assumption"] = assumption
         scenarios.append(result)
-    return scenarios, {"acquisition_price": acquisition, "additional_costs": additional,
-                       "expected_resale_value": resale, "holding_years": years}
+    return scenarios, inputs
     try:
         return float(match.group(0).replace(",", ""))
     except ValueError:
@@ -1186,7 +1259,7 @@ header .subtitle{color:#dbe6f3;margin-top:6px}h2{font-size:17px;color:var(--navy
 .inputs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}label{font-size:12px;color:var(--muted)}
 input,textarea,button{width:100%;font:inherit;padding:10px;border:1px solid #cbd5e1;border-radius:5px;background:white}
 button{background:var(--navy);border-color:var(--navy);color:white;font-weight:bold;cursor:pointer}.scenarios{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
-.scenario{border:1px solid var(--line);border-radius:7px;padding:13px}.scenario h3{color:var(--navy);margin:0 0 8px;font-size:15px}
+.scenario{border:1px solid var(--line);border-radius:7px;padding:13px}.scenario h3{color:var(--navy);margin:0 0 8px;font-size:15px}.scenario .detail{padding:8px 0}.roi-metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 18px;margin:14px 0}.roi-source{font-size:12px;color:var(--muted);line-height:1.5}
 .links{display:flex;flex-wrap:wrap;gap:12px;margin-top:12px}.links a{color:var(--blue);font-size:13px;font-weight:bold;overflow-wrap:anywhere}
 .history-table{width:100%;border-collapse:collapse;font-size:12px}.history-table th,.history-table td{text-align:left;border-bottom:1px solid #edf0f4;padding:8px}
 .chart{border:1px solid var(--line);border-radius:7px;padding:8px;margin:12px 0;overflow:hidden}.chart svg{display:block;width:100%;height:auto;min-height:240px}.chart circle{cursor:pointer;fill:#245b91;stroke:#fff;stroke-width:1.5}.chart .comparable-point{fill:#8a5a00}.chart .median-line{fill:none;stroke:#173354;stroke-width:2;stroke-dasharray:6 4}.axis-label{fill:var(--muted);font-size:10px}.chart-legend{font-size:12px;color:var(--muted);margin:4px 0 8px}
@@ -1248,13 +1321,18 @@ button{background:var(--navy);border-color:var(--navy);color:white;font-weight:b
 <table class="history-table"><thead><tr><th>Auction date</th><th>Plot</th><th>Area</th><th>Category</th><th>Auctioned rate</th><th>Source</th></tr></thead><tbody>
 {% for point in comparables %}<tr><td>{{ point.date_label }}</td><td>{{ point.plot_number }}</td><td>{{ point.area_label }}</td><td>{{ point.category }}</td><td>{{ point.amount_label }} INR/sqm</td><td><a href="{{ point.source_url }}" target="_blank" rel="noopener noreferrer">Official source ↗</a></td></tr>{% endfor %}
 </tbody></table>{% endif %}</section>
-<section class="panel"><h2>ROI scenario calculator</h2><p class="muted">Enter assumptions below. Total invested cost = acquisition price + additional costs. Net profit = expected resale value − total invested cost. ROI = net profit ÷ total invested cost. Annualized ROI uses compound annualization when holding period is positive.</p>
-<form method="post" class="inputs"><label>Acquisition price (INR)<input name="acquisition_price" value="{{ inputs.acquisition_price or '' }}" inputmode="decimal" required></label>
-<label>Additional costs (INR)<input name="additional_costs" value="{{ inputs.additional_costs or '' }}" inputmode="decimal" required></label>
-<label>Expected resale value (INR)<input name="expected_resale_value" value="{{ inputs.expected_resale_value or '' }}" inputmode="decimal" required></label>
-<label>Holding period (years, optional)<input name="holding_years" value="{{ inputs.holding_years or '' }}" inputmode="decimal"></label>
+<section class="panel"><h2>ROI scenario calculator</h2><p class="muted">This is an estimate tool, not a valuation or prediction. Total investment = acquisition price + additional costs such as registration, stamp duty, legal fees and development. Net profit/loss = assumed resale value − total investment. Annualized ROI is shown only when the holding period and values make compound annualization valid.</p>
+<div class="notice"><strong>Property fact versus assumption:</strong> {{ inputs.price_basis }} All entered costs and resale values are user assumptions. Confirm the official notice, auction terms and final consideration separately.</div>
+{% if inputs.validation_error %}<div class="notice"><strong>Input issue:</strong> {{ inputs.validation_error }}</div>{% endif %}
+<form method="post" class="inputs" id="roi-form">
+<label>Acquisition price (INR)<input name="acquisition_price" value="{{ inputs.acquisition_price if inputs.acquisition_price is not none else '' }}" inputmode="decimal" min="0" required><span class="roi-source">Prefilled from the selected property's source-listed value when available.</span></label>
+<label>Property area (sqm)<input name="area_sqm" value="{{ inputs.area_sqm if inputs.area_sqm is not none else '' }}" inputmode="decimal" min="0" step="any"><span class="roi-source">Editable; used only for the price-per-sqm calculation.</span></label>
+<label>Additional costs (INR)<input name="additional_costs" value="{{ inputs.additional_costs if inputs.additional_costs is not none else '' }}" inputmode="decimal" min="0" required><span class="roi-source">Registration, stamp duty, legal, development and other costs.</span></label>
+<label>Expected resale value (INR)<input name="expected_resale_value" value="{{ inputs.expected_resale_value if inputs.expected_resale_value is not none else '' }}" inputmode="decimal" min="0" required><span class="roi-source">User-entered assumption; not a market prediction.</span></label>
+<label>Holding period (years, optional)<input name="holding_years" value="{{ inputs.holding_years if inputs.holding_years is not none else '' }}" inputmode="decimal" min="0" step="any"></label>
 <button type="submit">Calculate estimate scenarios</button></form>
-{% if scenarios %}<div class="scenarios">{% for scenario in scenarios %}<div class="scenario"><h3>{{ scenario.label }}</h3><p class="muted">{{ scenario.assumption }}</p><div class="detail"><small>Total invested cost</small><strong>₹{{ "{:,.2f}".format(scenario.total_cost) }}</strong></div><div class="detail"><small>Net profit</small><strong>₹{{ "{:,.2f}".format(scenario.net_profit) }}</strong></div><div class="detail"><small>ROI</small><strong>{{ "{:,.2f}".format(scenario.roi_percent) }}%</strong></div><div class="detail"><small>Annualized ROI</small><strong>{% if scenario.annualized_roi_percent is not none %}{{ "{:,.2f}".format(scenario.annualized_roi_percent) }}%{% else %}Not calculated{% endif %}</strong></div></div>{% endfor %}</div>{% endif %}</section>
+<div class="roi-metrics"><div class="detail"><small>Entered acquisition price per sqm</small><strong>{% if inputs.price_per_sqm is not none %}₹{{ format_inr(inputs.price_per_sqm) }}/sqm{% else %}Not calculated{% endif %}</strong></div><div class="detail"><small>Selected property source</small><strong>{% for link in inputs.source_links %}<a href="{{ link }}" target="_blank" rel="noopener noreferrer">Official source ↗</a>{% else %}No source link available{% endfor %}</strong></div></div>
+{% if scenarios %}<div class="scenarios">{% for scenario in scenarios %}<div class="scenario"><h3>{{ scenario.label }} <span class="pill warn">Estimate</span></h3><p class="muted">{{ scenario.assumption }}</p><div class="detail"><small>Assumed resale value</small><strong>₹{{ format_inr(scenario.resale_value) }}</strong></div><div class="detail"><small>Total investment</small><strong>₹{{ format_inr(scenario.total_cost) }}</strong></div><div class="detail"><small>Estimated net profit/loss</small><strong>₹{{ format_inr(scenario.net_profit) }}</strong></div><div class="detail"><small>Estimated ROI</small><strong>{{ format_inr(scenario.roi_percent) }}%</strong></div><div class="detail"><small>Annualized ROI</small><strong>{% if scenario.annualized_roi_percent is not none %}{{ format_inr(scenario.annualized_roi_percent) }}%{% else %}Not calculated{% endif %}</strong></div></div>{% endfor %}</div>{% endif %}</section>
 <section class="panel"><div class="assistant-shell">
 <div class="assistant-header"><span class="assistant-icon" aria-hidden="true">✦</span><div><h2 class="assistant-title">Gemini Research Assistant</h2><p class="assistant-subtitle">Property insights powered by verified data.</p></div></div>
 <p class="muted" style="padding:0 18px;margin:16px 0 0">Questions use this property's verified context plus matching local catalogue records. Optional official web research is disclosed when available. Gemini must distinguish sourced facts, calculations, assumptions, and unknowns.</p>
@@ -1647,9 +1725,39 @@ def _gemini_answer(item, history, comparables, scenarios, inputs, question):
         "web_research_status": web_status,
         "official_web_evidence": web_evidence,
     }
+    roi_missing = [
+        label for key, label in (
+            ("acquisition_price", "acquisition price"),
+            ("additional_costs", "additional costs"),
+            ("expected_resale_value", "expected resale value"),
+        )
+        if inputs.get(key) is None
+    ]
+    context["profitability_assessment_guidance"] = {
+        "missing_user_inputs": roi_missing,
+        "required_conclusion_style": (
+            "Give a conditional evidence-based conclusion: potentially attractive under "
+            "the stated assumptions, insufficient evidence to assess, or high risk based "
+            "on the available evidence. Do not guarantee returns."
+        ),
+        "required_sections": [
+            "Verified facts and sources",
+            "Calculations and user assumptions",
+            "Positive indicators",
+            "Risks and unknowns",
+            "Evidence that would change the assessment",
+        ],
+    }
     prompt = (
         "Answer about the user's question using only the supplied context. "
         "Distinguish sourced facts, calculated results, user assumptions, and unknowns. "
+        "For profitability, worth-investigating, or ROI questions, use the supplied "
+        "roi_inputs and roi_scenarios when present. If inputs are missing, name the "
+        "missing inputs and still provide a preliminary assessment from the verified "
+        "property facts, dated observations, and valid same-locality comparables. "
+        "Do not answer with a disclaimer alone. Explain positive indicators, risks, "
+        "unknowns, and what evidence would change the assessment, then give a "
+        "conditional conclusion rather than a guarantee. "
         "Comparable auctions are other properties, not this property's history. "
         "Never invent historical prices, citations, availability, distances, or legal/financial advice. "
         "Do not claim web research unless official_web_evidence is non-empty. "
@@ -1719,7 +1827,9 @@ def property_analysis(auction_id):
     history = load_property_history(auction_id, item)
     comparable_audit = audit_comparable_auctions(item)
     comparables = comparable_audit["included"]
-    scenarios, inputs = build_roi_scenarios(request.form if request.method == "POST" else {})
+    scenarios, inputs = build_roi_scenarios(
+        request.form if request.method == "POST" else {}, item
+    )
     return render_template_string(
         ANALYSIS_PAGE, item=item, history=history, chart_series=_chart_series(history),
         comparables=comparables, comparable_series=_comparable_chart_series(comparables),
@@ -1739,7 +1849,7 @@ def property_analysis_chat(auction_id):
     history = load_property_history(auction_id, item)
     comparable_audit = audit_comparable_auctions(item)
     comparables = comparable_audit["included"]
-    scenarios, inputs = build_roi_scenarios(request.form)
+    scenarios, inputs = build_roi_scenarios(request.form, item)
     answer, error = _gemini_answer(
         item, history, comparables, scenarios, inputs, request.form.get("question", "").strip()
     )
