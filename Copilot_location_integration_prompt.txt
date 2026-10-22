@@ -1,0 +1,12 @@
+Copilot task — integrate jli_researched_location_candidates.csv safely.
+
+1. Inspect the current app.py, SQLite schema, and existing location records first.
+2. Back up every file/database you will modify.
+3. Treat the CSV as research input, not unquestionable truth. Preserve source URLs, coordinate_subject, precision, verification_status, confidence, and notes.
+4. Do NOT upgrade locality-only or provisional candidates to verified scheme pins. Do not overwrite existing Riyasat Nirvana or Yamuna Vihar records.
+5. Import only candidates the schema can represent without losing metadata. If schema cannot represent this, propose a migration and implement it only after a local backup.
+6. Deendayal Nagar, Hari Enclave, and Gokul Nagar Yojana must be labelled approximate locality navigation only, with a visible warning that the actual scheme boundary/plot is unverified.
+7. Keep Anand Vihar and Aditya Vihar unmapped until better evidence exists.
+8. Add exact normalized aliases only where supported by official names; no fuzzy matching.
+9. Test Riyasat Nirvana, Yamuna Vihar, Deendayal Nagar, Hari Enclave, Gokul Nagar Yojana, Anand Vihar, and an unrelated unmapped scheme.
+10. Do not commit, push, deploy, or change production settings. Report imported/skipped records and test output.
