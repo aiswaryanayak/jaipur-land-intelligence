@@ -1443,9 +1443,12 @@ def _gemini_answer(item, history, comparables, scenarios, inputs, question):
         + json.dumps(context, ensure_ascii=False)
         + "\nQuestion:\n" + question
     )
+    model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
+    if not model or "/" in model or ":" in model:
+        return None, "Gemini assistant configuration is invalid. Sourced property data remains available above."
     endpoint = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-2.0-flash:generateContent"
+        f"{model}:generateContent"
     )
     try:
         response = requests.post(

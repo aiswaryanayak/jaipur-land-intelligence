@@ -476,6 +476,45 @@ class PropertyAnalysisTests(unittest.TestCase):
         self.assertIn('"auction_id": "A-2"', prompt)
         self.assertIn("catalogue_matches", prompt)
 
+    def test_gemini_model_is_configurable_in_request_url(self):
+        fake_response = type("Response", (), {
+            "raise_for_status": lambda self: None,
+            "json": lambda self: {
+                "candidates": [{"content": {"parts": [{"text": "ok"}]}}]
+            },
+        })()
+        with patch.dict(
+            os.environ,
+            {"GEMINI_API_KEY": "test-key", "GEMINI_MODEL": "gemini-2.5-flash-lite"},
+            clear=True,
+        ), patch.object(
+            app, "_catalogue_matches", return_value=([], "timestamp")
+        ), patch.object(
+            app.requests, "post", return_value=fake_response
+        ) as post:
+            answer, error = app._gemini_answer(
+                property_item(), [], [], None, {}, "What is known?"
+            )
+        self.assertEqual(answer, "ok")
+        self.assertIsNone(error)
+        self.assertEqual(
+            post.call_args.args[0],
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            "gemini-2.5-flash-lite:generateContent",
+        )
+
+    def test_gemini_model_configuration_rejects_invalid_path(self):
+        with patch.dict(
+            os.environ,
+            {"GEMINI_API_KEY": "test-key", "GEMINI_MODEL": "models/bad"},
+            clear=True,
+        ):
+            answer, error = app._gemini_answer(
+                property_item(), [], [], None, {}, "What is known?"
+            )
+        self.assertIsNone(answer)
+        self.assertIn("configuration is invalid", error)
+
     def test_empty_catalogue_matches_are_preserved(self):
         fake_response = type("Response", (), {
             "raise_for_status": lambda self: None,
