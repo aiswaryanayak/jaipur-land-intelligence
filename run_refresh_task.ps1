@@ -9,7 +9,7 @@ $log = Join-Path $logDir "refresh_$stamp.log"
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 Push-Location $repo
 try {
-    & $python $pipeline --retries 2 --interval 1 --cache-ttl 900 *>&1 | Tee-Object -FilePath $log
+    & $python $pipeline --retries 2 --interval 1 --cache-ttl 900 --riico-retries 2 --riico-connect-timeout 10 --riico-read-timeout 30 --promote-jda-post-auction --promote-udh-catalogue *>&1 | Tee-Object -FilePath $log
     $exitCode = $LASTEXITCODE
     if ($null -eq $exitCode) { $exitCode = 0 }
     exit $exitCode

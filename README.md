@@ -87,7 +87,31 @@ without promoting them into the SQLite catalogue. RIICO rows whose EMD deadline
 has passed are displayed as closed/unavailable, and RHB/JDA allotment rows are
 displayed as historical outcomes rather than active opportunities.
 
-## Automated source refresh (local staging only)
+## Production JDA refresh
+
+The primary application (`gunicorn app:app` or `python app.py`) reads completed
+JDA post-auction outcomes from `data/jda_post_auction_latest.json`. The
+authenticated **Refresh JDA data now** button runs the existing
+`refresh_pipeline.py`, fetches the complete discovered UDH live-auction
+catalogue, validates required fields and dates, and atomically promotes it to
+`deploy_data/auctions.json`. It also validates and merges completed JDA
+post-auction rows into their separate source file. Existing data is preserved
+when any source fails, times out, is rate-limited, or is incomplete.
+
+For a scheduled job, run the same command from the repository root:
+
+```powershell
+python refresh_pipeline.py --retries 2 --interval 1 --cache-ttl 900 --riico-retries 2 --riico-connect-timeout 10 --riico-read-timeout 30 --promote-jda-post-auction --promote-udh-catalogue
+```
+
+The existing Windows helper
+`setup_refresh_task.ps1 -Register` schedules this command through
+`run_refresh_task.ps1`. On Render, configure a separate Cron Job using the
+same command and the repository's Python environment. The web service itself
+does not run background schedules. The refresh lock prevents the web button and
+scheduled job from running concurrently.
+
+## Automated source refresh
 
 The repeatable refresh command is:
 
@@ -96,8 +120,8 @@ The repeatable refresh command is:
 ```
 
 It fetches independent official-source inputs for RIICO e-auctions and
-direct allotments, JDA post-auction results, and the UDH/JDA live index. Each
-run writes a manifest and raw parsed records under
+direct allotments, JDA post-auction results, and the complete discovered UDH
+live catalogue. Each run writes a manifest and raw parsed records under
 `data\refresh_pipeline\runs\<run-id>\`, with a copy at
 `data\refresh_pipeline\latest.json`. Requests use bounded retries, a one-second
 interval, and a fifteen-minute response cache by default:
@@ -106,9 +130,10 @@ interval, and a fifteen-minute response cache by default:
 .venv\Scripts\python.exe refresh_pipeline.py --retries 2 --interval 1 --cache-ttl 900
 ```
 
-Refresh output is staging only. It does not promote records into
-`data\jaipur_land_intelligence.sqlite3`, replace the 238-record catalogue, or
-publish closed records as available. A source failure or HTTP 429 is recorded
+Without promotion flags, output is staging only. With
+`--promote-udh-catalogue`, a complete validated UDH response atomically replaces
+`deploy_data\auctions.json`; completed post-auction records remain separate.
+A source failure or HTTP 429 is recorded
 in the run manifest and does not cancel records by itself.
 
 For Windows Task Scheduler, create a task that runs at an authority-approved

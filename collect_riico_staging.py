@@ -91,6 +91,7 @@ def collect_unit(
     unit_name: str,
     checked: datetime,
     session: requests.Session | None = None,
+    timeout: tuple[float, float] = (10.0, 30.0),
 ) -> list[dict[str, str]]:
     params = {
         "unitId": unit_id,
@@ -100,7 +101,7 @@ def collect_unit(
     }
     source_url = AUCTION_URL + "?" + urlencode(params)
     client = session or requests
-    response = client.get(source_url, timeout=60)
+    response = client.get(source_url, timeout=timeout)
     response.raise_for_status()
     soup = BeautifulSoup(response.text, "html.parser")
     area = ""
@@ -168,6 +169,7 @@ def check_direct(
     unit_id: str,
     unit_name: str,
     session: requests.Session | None = None,
+    timeout: tuple[float, float] = (10.0, 30.0),
 ) -> dict[str, str]:
     params = {
         "unitId": unit_id, "viewBy": "1", "usageType": "",
@@ -176,7 +178,7 @@ def check_direct(
     }
     url = DIRECT_URL + "?" + urlencode(params)
     client = session or requests
-    response = client.get(url, timeout=60)
+    response = client.get(url, timeout=timeout)
     response.raise_for_status()
     text = BeautifulSoup(response.text, "html.parser").get_text(" ", strip=True)
     return {

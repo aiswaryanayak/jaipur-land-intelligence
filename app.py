@@ -121,14 +121,21 @@ A future deadline does not prove that an auction is open or a property is availa
 Check the latest official auction details, corrigenda and notices before acting.</div>
 <section class="card">
 <h3>Automated source refresh</h3>
+<form method="post" action="/refresh" style="margin:12px 0">
+<button type="submit">Refresh JDA data now</button>
+</form>
 {% if refresh_status %}
 <p class="muted">Run {{ refresh_status.run_id }} · checked {{ refresh_status.checked_at }}</p>
 <div class="details">{% for source in refresh_status.sources %}
-<div class="detail"><small>{{ source.source_key }}</small><strong>{{ source.fetch_status }} · {{ source.record_count }} records{% if source.error %} · {{ source.error }}{% endif %}</strong></div>
+<div class="detail"><small>{{ source.source_key }}</small><strong>{{ source.fetch_status }} · {{ source.record_count }} records{% if source.error_summaries %} · {{ source.error_summaries|join('; ') }}{% endif %}</strong></div>
 {% endfor %}</div>
-<p class="muted">Refresh output is staged for review. It is not automatically promoted into this catalogue.</p>
+{% if refresh_status.production_promotions %}
+<p class="muted">Validated source data was promoted atomically. Existing records were preserved; failed or stale sources were not treated as withdrawals.</p>
 {% else %}
-<p class="muted">No refresh manifest is available. Run the local refresh command to populate source health information.</p>
+<p class="muted">Refresh output is staged only. No production source was changed.</p>
+{% endif %}
+{% else %}
+<p class="muted">No refresh manifest is available. Use Refresh JDA data now or the scheduled refresh task.</p>
 {% endif %}
 </section>
 <section class="stats">
@@ -320,9 +327,10 @@ def latest_snapshot_file():
 
 
 def load_catalogue():
-    """Load the latest successful refresh snapshot, falling back to the original catalogue."""
+    """Load the newest valid production catalogue or refresh snapshot."""
     snapshot_file = latest_snapshot_file()
-    data_file = snapshot_file or DATA_FILE
+    candidates = [path for path in (DATA_FILE, snapshot_file) if path and path.exists()]
+    data_file = max(candidates, key=lambda path: path.stat().st_mtime) if candidates else DATA_FILE
 
     if not data_file.exists():
         raise FileNotFoundError(f"Could not find a refresh snapshot or catalogue: {data_file}")
@@ -641,13 +649,31 @@ def _record_zone(record):
 def audit_comparable_auctions(item):
     """Classify source rows before selecting same-locality comparables."""
     if not POST_AUCTION_FILE.exists():
-        return {"included": [], "same_zone_unverified": 0, "excluded": 0}
+        return {
+            "included": [],
+            "same_zone_unverified": 0,
+            "excluded": 0,
+            "source_status": "unavailable",
+            "source_message": "JDA post-auction source unavailable; comparable results were not evaluated.",
+        }
     try:
         records = json.loads(POST_AUCTION_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError):
-        return {"included": [], "same_zone_unverified": 0, "excluded": 0}
+        return {
+            "included": [],
+            "same_zone_unverified": 0,
+            "excluded": 0,
+            "source_status": "unavailable",
+            "source_message": "JDA post-auction source could not be read; comparable results were not evaluated.",
+        }
     if not isinstance(records, list):
-        return {"included": [], "same_zone_unverified": 0, "excluded": 0}
+        return {
+            "included": [],
+            "same_zone_unverified": 0,
+            "excluded": 0,
+            "source_status": "unavailable",
+            "source_message": "JDA post-auction source has an invalid format; comparable results were not evaluated.",
+        }
 
     target_category = _normalized_identity(item.get("usage"))
     target_area = _area_number(item.get("area"))
@@ -727,6 +753,8 @@ def audit_comparable_auctions(item):
         "included": sorted(unique.values(), key=lambda entry: (entry["date"], entry["plot_number"])),
         "same_zone_unverified": same_zone_unverified,
         "excluded": excluded,
+        "source_status": "available",
+        "source_message": "JDA post-auction source loaded and records were evaluated against the strict locality and zone checks.",
     }
 
 
@@ -918,6 +946,33 @@ def load_refresh_status():
     except (OSError, ValueError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+@app.route("/refresh", methods=["POST"])
+def refresh_sources():
+    try:
+        import refresh_pipeline
+
+        args = refresh_pipeline.argparse.Namespace(
+            run_id=None,
+            retries=2,
+            interval=1.0,
+            cache_ttl=900,
+            no_cache=False,
+            promote_jda_post_auction=True,
+            promote_udh_catalogue=True,
+            riico_retries=2,
+            riico_connect_timeout=10.0,
+            riico_read_timeout=30.0,
+        )
+        manifest = refresh_pipeline.run_pipeline(args)
+    except (OSError, ValueError, RuntimeError, requests.RequestException) as exc:
+        return f"<h1>Refresh failed</h1><p>{text(exc)}</p><p><a href='/'>Back to listings</a></p>", 502
+    return render_template_string(
+        "<h1>Refresh complete</h1><p>Run {{ run_id }} completed.</p>"
+        "<p><a href='/'>Return to listings</a></p>",
+        run_id=manifest["run_id"],
+    )
 
 
 
@@ -1306,8 +1361,8 @@ button{background:var(--navy);border-color:var(--navy);color:white;font-weight:b
 </tbody></table>{% endif %}</section>
 <section class="panel"><h2>Comparable Auction Rates</h2>
 <p class="muted">These are completed auction rates for other plots whose original JDA source row explicitly identifies the same locality. They are not historical prices for this property and do not establish physical distance or plot proximity. Rates are INR per square metre, sorted by auction date; category and area are shown for comparison.</p>
-<div class="notice"><strong>Source audit:</strong> {{ comparable_audit.same_zone_unverified }} same-zone record(s) were not included because their locality could not be verified from the original source row; {{ comparable_audit.excluded }} record(s) were excluded as unrelated or invalid. Only verified same-locality records are graphed and included in statistics.</div>
-{% if not comparables %}<p class="muted">No valid, dated, sourced comparable auction results are available for this scheme/area.</p>
+<div class="notice"><strong>Source audit:</strong> {{ comparable_audit.source_message }}{% if comparable_audit.source_status == "available" %} {{ comparable_audit.same_zone_unverified }} same-zone record(s) were not included because their locality could not be verified from the original source row; {{ comparable_audit.excluded }} record(s) were excluded as unrelated or invalid. Only verified same-locality records are graphed and included in statistics.{% endif %}</div>
+{% if not comparables %}<p class="muted">{% if comparable_audit.source_status == "unavailable" %}Comparable auction data is currently unavailable because the verified JDA post-auction source is not present in this deployment.{% else %}No valid, dated, sourced comparable auction results are available for this scheme/area.{% endif %}</p>
 {% else %}
 {% for series in comparable_series %}<div class="chart"><strong>INR per square metre · {{ series.tier }}</strong><div class="chart-legend">● Individual auction · <span style="color:#173354">━ ━</span> Median rate by auction date{% if series.log_scale %} · Log-scaled visual axis; labels show actual rates{% endif %}</div><svg viewBox="0 0 700 250" role="img" aria-label="Comparable auction rates scatter plot">
 {% for tick in series.y_ticks %}<line x1="56" x2="680" y1="{{ tick.y }}" y2="{{ tick.y }}" stroke="#edf0f4"/><text x="2" y="{{ tick.y + 4 }}" class="axis-label">{{ tick.label }}</text>{% endfor %}
