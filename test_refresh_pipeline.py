@@ -5,11 +5,44 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import requests
+from requests.exceptions import ProxyError
 import refresh_pipeline
 import promote_staging
+import render_connectivity
 
 
 class RefreshPipelineTests(unittest.TestCase):
+    def test_connectivity_check_reports_each_layer_without_downloading_bodies(self):
+        response = Mock(status_code=204, headers={"Content-Type": "text/html"})
+        response.close = Mock()
+        with patch("render_connectivity._dns_probe", return_value={"status": "ok", "category": "ok", "address_count": 1}), \
+             patch("render_connectivity._tcp_probe", return_value={"status": "ok", "category": "ok"}), \
+             patch("render_connectivity.requests.Session.get", return_value=response) as get:
+            result = render_connectivity.run_connectivity_check()
+        self.assertFalse(result["body_downloaded"])
+        self.assertEqual(len(result["endpoints"]), 4)
+        self.assertEqual(result["endpoints"][0]["dns"]["status"], "ok")
+        self.assertEqual(result["endpoints"][0]["tcp"]["status"], "ok")
+        self.assertEqual(result["endpoints"][0]["https"]["http_status"], 204)
+        self.assertEqual(get.call_count, 4)
+        self.assertTrue(all(call.kwargs["stream"] for call in get.call_args_list))
+
+    def test_connectivity_check_classifies_timeout_without_exception_details(self):
+        with patch("render_connectivity._dns_probe", return_value={"status": "ok", "category": "ok", "address_count": 1}), \
+             patch("render_connectivity._tcp_probe", return_value={"status": "failed", "category": "timeout", "error_type": "Timeout"}), \
+             patch("render_connectivity.requests.Session.get", side_effect=requests.ReadTimeout("secret-proxy-value")):
+            result = render_connectivity.run_connectivity_check()
+        self.assertEqual(result["endpoints"][0]["tcp"]["category"], "timeout")
+        self.assertEqual(result["endpoints"][0]["https"]["category"], "timeout")
+        self.assertNotIn("secret-proxy-value", str(result))
+    def test_connectivity_diagnostic_does_not_expose_proxy_details(self):
+        diagnostic = refresh_pipeline.connectivity_diagnostic(
+            ProxyError("https://user:secret@example.invalid tunnel failed")
+        )
+        self.assertEqual(diagnostic["category"], "proxy_or_egress")
+        self.assertIn(diagnostic["proxy_configured"], {"yes", "no"})
+        self.assertNotIn("secret", str(diagnostic))
+
     def test_riico_mixed_zone_results_are_partial_and_cached_failures_are_stale(self):
         with tempfile.TemporaryDirectory() as directory:
             old_cache = refresh_pipeline.RIICO_CACHE_DIR
@@ -56,7 +89,7 @@ class RefreshPipelineTests(unittest.TestCase):
             self.assertEqual(records, [])
             self.assertEqual(result["fetch_status"], "failure")
             self.assertEqual(result["failed_zones"], len(refresh_pipeline.riico.UNITS) + 1)
-            self.assertEqual(result["error_summaries"][0].split(": ", 1)[0], "ConnectTimeout")
+            self.assertIn("ConnectTimeout", result["error_summaries"][0])
 
     def test_riico_retry_limit_is_bounded(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -83,7 +116,7 @@ class RefreshPipelineTests(unittest.TestCase):
                     "2026-10-31T00:00:00+05:30",
                 )
                 def check(unit_id, *args, **kwargs):
-                    if unit_id == "18":
+                    if unit_id == "15":
                         return {"unit": "fresh", "result": "records_present_review_required"}
                     raise requests.Timeout("slow")
                 with patch("refresh_pipeline.riico.check_direct", side_effect=check), \

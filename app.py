@@ -14,7 +14,7 @@ from urllib.parse import urlparse, urlencode
 import hmac
 import os
 import requests
-from flask import Flask, render_template_string, request, Response
+from flask import Flask, jsonify, render_template_string, request, Response
 
 app = Flask(__name__)
 SITE_PASSWORD = os.environ.get("SITE_PASSWORD", "")
@@ -139,12 +139,19 @@ Check the latest official auction details, corrigenda and notices before acting.
 {% endif %}
 </section>
 <section class="stats">
-<div class="stat"><strong>{{ total }}</strong><span>Unique auction IDs in collected catalogue</span></div>
-<div class="stat"><strong>{{ upcoming }}</strong><span>Records with a future parsed bid deadline</span></div>
-<div class="stat"><strong>{{ needs_check }}</strong><span>Records needing current official verification</span></div>
+<div class="stat"><strong>{{ status_counts.active }}</strong><span>Active opportunities</span></div>
+<div class="stat"><strong>{{ status_counts.upcoming }}</strong><span>Upcoming opportunities</span></div>
+<div class="stat"><strong>{{ status_counts.expired }}</strong><span>Expired listings retained</span></div>
+<div class="stat"><strong>{{ status_counts.completed }}</strong><span>Completed / historical</span></div>
+<div class="stat"><strong>{{ status_counts.unverified }}</strong><span>Needs verification</span></div>
+<div class="stat"><strong>{{ total }}</strong><span>Total catalogue records</span></div>
 </section>
 <form class="filters" method="get" action="/">
 <input name="q" value="{{ q }}" placeholder="Search scheme, plot, property or auction ID">
+<select name="authority">
+<option value="all" {% if authority_filter == 'all' %}selected{% endif %}>All authorities</option>
+{% for authority in authorities %}<option value="{{ authority }}" {% if authority_filter == authority %}selected{% endif %}>{{ authority }}</option>{% endfor %}
+</select>
 <select name="category">
 <option value="all" {% if category == 'all' %}selected{% endif %}>All property types</option>
 <option value="residential" {% if category == 'residential' %}selected{% endif %}>Residential</option>
@@ -152,6 +159,8 @@ Check the latest official auction details, corrigenda and notices before acting.
 <option value="other" {% if category == 'other' %}selected{% endif %}>Other / unclassified</option>
 
 </select>
+<input name="min_area" type="number" min="0" step="0.01" value="{{ min_area }}" placeholder="Minimum area">
+<input name="max_area" type="number" min="0" step="0.01" value="{{ max_area }}" placeholder="Maximum area">
 <select name="deadline">
   <option value="all" {% if deadline_filter == 'all' %}selected{% endif %}>All deadline statuses</option>
   <option value="upcoming" {% if deadline_filter == 'upcoming' %}selected{% endif %}>Future deadline — verify</option>
@@ -168,6 +177,7 @@ Check the latest official auction details, corrigenda and notices before acting.
 <button type="submit">Search listings</button>
 
 </form>
+{% if refresh_warnings %}<div class="notice"><strong>Freshness warning:</strong> {{ refresh_warnings|join(' · ') }}</div>{% endif %}
 <div class="resultshead"><strong>{{ results|length }} matching records</strong>
 <span class="muted">Deadline status is based on dates published in the collected record.</span></div>
 <section class="results">
@@ -284,6 +294,40 @@ def parse_date(value):
         return None
 
 
+def numeric_area(value):
+    match = re.search(r"\d[\d,]*(?:\.\d+)?", text(value))
+    if not match:
+        return None
+    return float(match.group(0).replace(",", ""))
+
+
+def classify_listing(item, now=None):
+    """Classify a listing using official dates and any explicit source status."""
+    now = now or datetime.now(IST)
+    bid_dt = item.get("_bid_dt")
+    emd_dt = parse_date(item.get("emd_end"))
+    source_status = text(item.get("_source_status")).casefold()
+    if "historical" in source_status or "completed" in source_status:
+        group, label, css = "completed", "Completed auction / historical record", "past"
+    elif bid_dt is None:
+        group, label, css = "unverified", "Current deadline not verified", "warn"
+    elif bid_dt < now:
+        group, label, css = "expired", "Published bid deadline has passed", "past"
+    elif emd_dt is not None and emd_dt < now:
+        group, label, css = "unverified", "EMD deadline passed — eligibility needs verification", "warn"
+    elif any(marker in source_status for marker in ("active", "live", "open")):
+        group, label, css = "active", "Official source reports opportunity active", "future"
+    else:
+        group, label, css = "upcoming", "Future published deadline — official status unverified", "future"
+    return {
+        "status_group": group,
+        "deadline_status": label,
+        "status_class": css,
+        "_emd_dt": emd_dt,
+        "_area": numeric_area(item.get("area")),
+    }
+
+
 def official_links(value):
     """Keep exact official URLs from the collected data; never rebuild URLs."""
     found = []
@@ -390,18 +434,12 @@ def load_catalogue():
         emd_dt = parse_date(emd_end)
         bid_dt = parse_date(bid_end)
 
-        if bid_dt and bid_dt < now:
-            status = "Published bid deadline has passed"
-            status_class = "past"
-        elif emd_dt and emd_dt < now:
-            status = "Published EMD deadline has passed — verify eligibility"
-            status_class = "warn"
-        elif bid_dt and bid_dt >= now:
-            status = "Future bid deadline listed — verify officially"
-            status_class = "future"
-        else:
-            status = "Deadline not reliably parsed — verify"
-            status_class = "warn"
+        status_fields = classify_listing({
+            "emd_end": emd_end,
+            "_bid_dt": bid_dt,
+            "_source_status": rec.get("current_status", ""),
+            "area": area,
+        }, now)
 
         listing_links = []
         detail_links = []
@@ -428,8 +466,9 @@ def load_catalogue():
             "bid_end": bid_end or "Not reliably extracted",
             "category": category,
             "category_label": category_label,
-            "deadline_status": status,
-            "status_class": status_class,
+            "deadline_status": status_fields["deadline_status"],
+            "status_class": status_fields["status_class"],
+            "status_group": status_fields["status_group"],
             "listing_links": list(dict.fromkeys(listing_links)),
             "detail_links": list(dict.fromkeys(detail_links)),
             "provenance_count": len(observations),
@@ -437,6 +476,9 @@ def load_catalogue():
             "source_authority": text(rec.get("source_authority")) or "Unspecified authority",
             "_bid_dt": bid_dt,
             "_price": numeric_price(assessed),
+            "_emd_dt": status_fields["_emd_dt"],
+            "_area": status_fields["_area"],
+            "_source_status": text(rec.get("current_status")).casefold(),
         })
 
     items.sort(key=lambda item: (
@@ -907,7 +949,7 @@ def load_authority_records(authority_key):
         if not isinstance(record, dict) or record.get("_display_authority") != authority_key:
             continue
         status = text(record.get("current_status")) or "status not verified"
-        selected.append({
+        row = {
             "auction_id": text(record.get("original_identifier")) or text(record.get("record_key")),
             "title": text(record.get("title")) or "Untitled authority record",
             "scheme": text(record.get("scheme_or_industrial_area")) or "Not stated",
@@ -933,7 +975,9 @@ def load_authority_records(authority_key):
             "_price": numeric_price(record.get("reserve_price_or_rate")),
             "_source_status": status.casefold(),
             "_display_record": True,
-        })
+        }
+        row.update(classify_listing(row))
+        selected.append(row)
     return selected
 
 
@@ -946,6 +990,13 @@ def load_refresh_status():
     except (OSError, ValueError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+@app.route("/diagnostics/connectivity", methods=["GET"])
+def connectivity_diagnostics():
+    import render_connectivity
+
+    return jsonify(render_connectivity.run_connectivity_check())
 
 
 @app.route("/refresh", methods=["POST"])
@@ -987,8 +1038,10 @@ def home():
 
     now = datetime.now(IST)
     q = request.args.get("q", "").strip().lower()
+    authority_filter = request.args.get("authority", "all").strip()
     category = request.args.get("category", "all").strip().lower()
     deadline_filter = request.args.get("deadline", "all").strip().lower()
+    authorities = sorted({item["source_authority"] for item in items if item.get("source_authority")})
     price_values = [item["_price"] for item in items if item["_price"] is not None]
     price_min = min(price_values) if price_values else 0
     price_max = max(price_values) if price_values else 0
@@ -1002,17 +1055,29 @@ def home():
         max_price = price_max
     if min_price > max_price:
         min_price, max_price = max_price, min_price
+    try:
+        min_area = max(0.0, float(request.args.get("min_area", 0)))
+    except (TypeError, ValueError):
+        min_area = 0.0
+    try:
+        max_area = max(min_area, float(request.args.get("max_area", 0)))
+    except (TypeError, ValueError):
+        max_area = 0.0
+    if max_area <= 0:
+        max_area = max((item.get("_area") or 0 for item in items), default=0)
 
     if category not in {"all", "residential", "commercial", "other"}:
         category = "all"
 
-    if deadline_filter not in {"all", "upcoming", "passed", "unknown"}:
+    if deadline_filter == "passed":
+        deadline_filter = "expired"
+    if deadline_filter not in {"all", "active", "upcoming", "expired", "completed", "unknown", "unverified"}:
         deadline_filter = "all"
 
-    upcoming = sum(
-        1 for item in items
-        if item["_bid_dt"] and item["_bid_dt"] >= now
-    )
+    status_counts = {key: 0 for key in ("active", "upcoming", "expired", "completed", "unverified")}
+    for item in items:
+        item.update(classify_listing(item, now))
+        status_counts[item["status_group"]] += 1
 
     results = []
     for item in items:
@@ -1025,38 +1090,38 @@ def home():
         if q and q not in searchable:
             continue
 
+        if authority_filter != "all" and item["source_authority"] != authority_filter:
+            continue
         if category != "all" and item["category"] != category:
             continue
         if item["_price"] is not None and not (min_price <= item["_price"] <= max_price):
             continue
         if item["_price"] is None and (min_price > price_min or max_price < price_max):
             continue
-
-        bid_dt = item["_bid_dt"]
-        emd_dt = parse_date(item["emd_end"])
-
-        # A future bid deadline alone does not prove that bidding is possible.
-        if bid_dt is None:
-            item["deadline_status"] = "Deadline not reliably parsed — verify"
-            item["status_class"] = "warn"
-            status_group = "unknown"
-        elif bid_dt < now:
-            item["deadline_status"] = "Published bid deadline has passed"
-            item["status_class"] = "past"
-            status_group = "passed"
-        elif emd_dt and emd_dt < now:
-            item["deadline_status"] = "EMD deadline has passed — eligibility needs verification"
-            item["status_class"] = "warn"
-            status_group = "unknown"
+        if item.get("_area") is not None and not (min_area <= item["_area"] <= max_area):
+            continue
+        if item.get("_area") is None and min_area > 0:
+            continue
+        if deadline_filter == "unknown":
+            selected_group = "unverified"
         else:
-            item["deadline_status"] = "Future published deadline — official status unverified"
-            item["status_class"] = "future"
-            status_group = "upcoming"
-
-        if deadline_filter != "all" and status_group != deadline_filter:
+            selected_group = deadline_filter
+        if selected_group != "all" and item["status_group"] != selected_group:
             continue
 
         results.append(item)
+
+    refresh_status = load_refresh_status()
+    refresh_warnings = []
+    if refresh_status:
+        for source in refresh_status.get("sources", []):
+            if source.get("fetch_status") in {"failure", "partial_success"}:
+                refresh_warnings.append(
+                    f"{source.get('source_key')}: {source.get('fetch_status')}; "
+                    "its listings may be stale"
+                )
+    else:
+        refresh_warnings.append("No refresh manifest is available; listings may be stale")
 
     return render_template_string(
         PAGE,
@@ -1064,15 +1129,19 @@ def home():
         q=request.args.get("q", ""),
         category=category,
         total=len(items),
-        upcoming=upcoming,
-        needs_check=len(items),
+        status_counts=status_counts,
+        authorities=authorities,
+        authority_filter=authority_filter,
+        min_area=min_area,
+        max_area=max_area,
         retrieved_at=retrieved_at,
         deadline_filter=deadline_filter,
         min_price=min_price,
         max_price=max_price,
         price_min=price_min,
         price_max=price_max,
-        refresh_status=load_refresh_status(),
+        refresh_status=refresh_status,
+        refresh_warnings=refresh_warnings,
     )
 
 
@@ -1166,18 +1235,16 @@ def authority_page(authority_key):
             continue
         if category != "all" and item["category"] != category:
             continue
-        if "historical" in item.get("_source_status", "") or "closed" in item.get("_source_status", ""):
-            item["deadline_status"], item["status_class"], group = item["_source_status"], "past", "passed"
-        elif item["_bid_dt"] is None:
-            item["deadline_status"], item["status_class"], group = "Needs verification", "warn", "unknown"
-        elif item["_bid_dt"] < now:
-            item["deadline_status"], item["status_class"], group = "Published bid deadline passed", "past", "passed"
-        else:
-            item["deadline_status"], item["status_class"], group = "Future published deadline — verify", "future", "upcoming"
-        if deadline != "all" and deadline != group:
+        item.update(classify_listing(item, now))
+        group = item["status_group"]
+        selected_deadline = "expired" if deadline == "passed" else "unverified" if deadline == "unknown" else deadline
+        if selected_deadline != "all" and selected_deadline != group:
             continue
         results.append(item)
-    upcoming = sum(1 for item in filtered if item["_bid_dt"] and item["_bid_dt"] >= now)
+    upcoming = sum(
+        1 for item in filtered
+        if classify_listing(item, now)["status_group"] in {"active", "upcoming"}
+    )
     return render_template_string(AUTHORITY_PAGE, title="Jaipur Land Intelligence", heading=heading,
         description=description, results=results, total=total, upcoming=upcoming, q=request.args.get("q", ""),
         category=category, deadline=deadline)

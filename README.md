@@ -81,6 +81,34 @@ the current Render deployment cannot safely serve the reviewed SQLite location
 data. Do not deploy this repository as if the ignored local database were
 available remotely.
 
+## Render connectivity diagnostic
+
+The protected, read-only endpoint
+`GET /diagnostics/connectivity` checks the four configured official endpoints
+without invoking the refresh pipeline, writing files, parsing catalogue data,
+or downloading response bodies. The existing Basic authentication middleware
+protects this endpoint; use the `viewer` username and the `SITE_PASSWORD`
+stored in Render's environment, without putting the password in shell history
+or a committed file.
+
+After deploying the reviewed code, run the following from a trusted terminal
+and keep the response private:
+
+```powershell
+$pair = "viewer:$env:SITE_PASSWORD"
+$encoded = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+Invoke-RestMethod `
+  -Uri "https://<render-service>.onrender.com/diagnostics/connectivity" `
+  -Headers @{ Authorization = "Basic $encoded" }
+```
+
+The response reports DNS, direct TCP, and HTTPS results separately for UDH,
+JDA post-auction, RIICO e-auction, and RIICO direct allotment. It reports only
+whether each proxy variable is configured, never its value. A timeout is
+classified separately from DNS, TLS, proxy/egress, connection, and HTTP
+response-status results. This diagnostic is not a substitute for the refresh
+command and must not be polled aggressively.
+
 The read-only `deploy_data/authority_records.json` snapshot powers the RIICO
 and Other Authorities reference pages. It contains reviewed staged records
 without promoting them into the SQLite catalogue. RIICO rows whose EMD deadline
