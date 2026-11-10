@@ -301,6 +301,18 @@ def numeric_area(value):
     return float(match.group(0).replace(",", ""))
 
 
+def normalized_area_for_record(record, display_area):
+    """Return square metres when staging metadata provides a safe conversion."""
+    staging = record.get("_jda_staging")
+    if isinstance(staging, dict):
+        normalized = staging.get("normalized_area")
+        if isinstance(normalized, dict):
+            value = normalized.get("square_metre_value")
+            if isinstance(value, (int, float)) and value >= 0:
+                return float(value)
+    return numeric_area(display_area)
+
+
 def classify_listing(item, now=None):
     """Classify a listing using official dates and any explicit source status."""
     now = now or datetime.now(IST)
@@ -337,6 +349,9 @@ def official_links(value):
             if candidate.startswith("https://"):
                 if urlparse(candidate).netloc.lower() == "udhonline.rajasthan.gov.in":
                     found.append(candidate)
+        elif isinstance(candidate, (list, tuple, set)):
+            for value in candidate:
+                add(value)
         elif isinstance(candidate, dict):
             for key in ("url", "href", "link", "detail_url", "listing_url"):
                 if candidate.get(key):
@@ -433,12 +448,13 @@ def load_catalogue():
 
         emd_dt = parse_date(emd_end)
         bid_dt = parse_date(bid_end)
+        normalized_area = normalized_area_for_record(rec, area)
 
         status_fields = classify_listing({
             "emd_end": emd_end,
             "_bid_dt": bid_dt,
             "_source_status": rec.get("current_status", ""),
-            "area": area,
+            "area": normalized_area,
         }, now)
 
         listing_links = []
@@ -447,6 +463,10 @@ def load_catalogue():
             listing_links.extend(official_links(observation.get("source_url")))
             listing_links.extend(official_links(observation.get("listing_url")))
             detail_links.extend(official_links(observation.get("detail_links")))
+            provenance = observation.get("source_provenance")
+            if isinstance(provenance, dict):
+                detail_links.extend(official_links(provenance.get("detail_urls")))
+                detail_links.extend(official_links(provenance.get("report_urls")))
             stamp = observation.get("retrieved_at_utc")
             if stamp:
                 timestamps.append(str(stamp))
@@ -474,10 +494,12 @@ def load_catalogue():
             "provenance_count": len(observations),
             "raw_text": row,
             "source_authority": text(rec.get("source_authority")) or "Unspecified authority",
+            "source_url": listing_links[0] if listing_links else "",
+            "listing_url": listing_links[0] if listing_links else "",
             "_bid_dt": bid_dt,
             "_price": numeric_price(assessed),
             "_emd_dt": status_fields["_emd_dt"],
-            "_area": status_fields["_area"],
+            "_area": normalized_area,
             "_source_status": text(rec.get("current_status")).casefold(),
         })
 
@@ -1351,7 +1373,7 @@ h2{font-size:17px;color:var(--navy);margin:0 0 14px}.grid{display:grid;grid-temp
 <p class="muted">{{ item.map_location.evidence_notes }}</p>
 </section>
 {% else %}
-<section class="panel"><h2>Explore the scheme area on Google Maps</h2><p class="muted"><strong>Scheme / area from source:</strong> {{ item.scheme }}</p><p class="muted">This map searches for the recorded scheme name in Jaipur, Rajasthan. Google Maps may show a general area or several possible matches; this is not a verified pin for the exact plot.</p><div class="map-frame"><iframe title="Google Maps search for the recorded scheme area" loading="lazy" referrerpolicy="no-referrer-when-downgrade" src="https://maps.google.com/maps?q={{ (item.scheme ~ ', Jaipur, Rajasthan')|urlencode }}&z=12&output=embed" allowfullscreen></iframe></div><div class="links"><a href="https://www.google.com/maps/search/?api=1&amp;query={{ (item.scheme ~ ', Jaipur, Rajasthan')|urlencode }}" target="_blank" rel="noopener noreferrer">Open this area search in Google Maps ↗</a></div><p class="muted">An exact property pin will only be shown when a verified coordinate is available. Confirm the plot against the official location plan before visiting or making a decision.</p></section>
+<section class="panel"><h2>Scheme / sector location</h2><p class="muted"><strong>Scheme / area from source:</strong> {{ item.scheme }}</p><p class="muted">Map navigation is not available yet. The scheme or sector name is shown as text because a reliable approximate-area map reference has not been verified. Confirm the plot against the official location plan before visiting or making a decision.</p></section>
 {% endif %}
 <section class="panel"><h2>Official source records</h2><p class="muted">These links are preserved from collected records; they are not reconstructed by this page.</p>
 <p><a href="/property/{{ item.auction_id }}/analysis">Open property-specific investment analysis ↗</a></p>

@@ -4,6 +4,7 @@ import json
 import re
 import sys
 import time
+import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -235,26 +236,31 @@ def parse_page(html, page_url, scheme_entry, retrieved_at):
 
 
 def main():
-    if not DISCOVERY_FILE.exists():
-        print(f"Discovery file not found: {DISCOVERY_FILE}")
-        return 1
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max-schemes", type=int, default=None)
+    parser.add_argument("--delay", type=float, default=PAUSE_SECONDS)
+    args = parser.parse_args()
     try:
-        discovery = json.loads(
-            DISCOVERY_FILE.read_text(encoding="utf-8")
+        import refresh_pipeline
+        discovery_session = requests.Session()
+        discovery_session.headers.update(HEADERS)
+        entries = refresh_pipeline.discover_udh_entries(
+            discovery_session,
+            retries=0,
+            interval=args.delay,
+            cache_ttl=0,
+            use_cache=False,
+            persist=True,
         )
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"Could not read discovery file: {exc}")
+    except Exception as exc:
+        print(f"Could not discover current UDH catalogue: {type(exc).__name__}: {exc}")
         return 1
-
-    entries = discovery.get("scheme_entries", [])
-
     if not entries:
         print("No scheme entries found.")
         return 1
 
-    # Intentionally limited to one scheme until the parser is validated.
-    entries = entries[:MAX_SCHEMES_PER_RUN]
+    if args.max_schemes is not None:
+        entries = entries[:max(0, args.max_schemes)]
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     retrieved_at = utc_now()
@@ -288,6 +294,16 @@ def main():
         try:
             response = session.get(url, timeout=TIMEOUT)
 
+            if response.status_code == 429:
+                errors.append({
+                    "scheme_name": entry.get("scheme_name"),
+                    "url": url,
+                    "http_status": 429,
+                    "retry_after": response.headers.get("Retry-After", ""),
+                    "error": "HTTP 429 rate limited; collection stopped",
+                })
+                print("HTTP 429; stopping without retrying.")
+                break
             if response.status_code != 200:
                 errors.append({
                     "scheme_name": entry.get("scheme_name"),
@@ -323,6 +339,15 @@ def main():
 
             for record in records:
                 record["page_title"] = page_title
+            try:
+                refresh_pipeline.validate_catalogue_records(records)
+            except ValueError as exc:
+                errors.append({
+                    "scheme_name": entry.get("scheme_name"),
+                    "url": url,
+                    "error": f"Validation error: {exc}",
+                })
+                continue
 
             all_records.extend(records)
             print(f"Parsed auction records: {len(records)}")
@@ -336,7 +361,7 @@ def main():
             })
             print(f"Request or parsing error: {exc}")
 
-        time.sleep(PAUSE_SECONDS)
+        time.sleep(max(0.0, args.delay))
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     snapshot_path = OUTPUT_DIR / f"jda_refresh_{stamp}.json"
@@ -348,7 +373,7 @@ def main():
         ),
         "retrieved_at_utc": retrieved_at,
         "test_scope": (
-            "First catalogue scheme only; not a complete refresh"
+            "Current live UDH discovery with bounded listing-page collection"
         ),
         "catalogue_entries_attempted": len(entries),
         "parsed_record_count": len(all_records),
@@ -386,4 +411,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-

@@ -9,7 +9,7 @@ os.environ["SITE_PASSWORD"] = "test-password"
 import app
 
 
-def item(auction_id, price, category="commercial", deadline="21-Oct-2026 05:00 PM"):
+def item(auction_id, price, category="commercial", deadline="21-Nov-2026 05:00 PM"):
     return {
         "auction_id": str(auction_id),
         "title": f"Plot {auction_id}",
@@ -20,7 +20,7 @@ def item(auction_id, price, category="commercial", deadline="21-Oct-2026 05:00 P
         "emd": "1000",
         "assessed_value": "" if price is None else f"{price:,.2f} (INR)",
         "emd_start": "01-Oct-2026 10:00 AM",
-        "emd_end": "20-Oct-2026 10:00 AM",
+        "emd_end": "20-Nov-2026 10:00 AM",
         "bid_start": "01-Oct-2026 10:00 AM",
         "bid_end": deadline,
         "category": category,
@@ -34,6 +34,7 @@ def item(auction_id, price, category="commercial", deadline="21-Oct-2026 05:00 P
         "source_authority": "Jaipur Development Authority",
         "_bid_dt": app.parse_date(deadline),
         "_price": price,
+        "_area": 100,
     }
 
 

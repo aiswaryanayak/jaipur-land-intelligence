@@ -1,6 +1,7 @@
 import json
 import re
 import time
+import argparse
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -132,11 +133,26 @@ def parse_listing(html, listing_url):
 
 
 def main():
-    if not CATALOG_PATH.exists():
-        raise SystemExit(f"Missing discovery catalog: {CATALOG_PATH}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max-pages", type=int, default=None)
+    parser.add_argument("--delay", type=float, default=DELAY_SECONDS)
+    parser.add_argument("--progress", type=Path, default=OUT_DIR / "jda_full_catalog_progress.json")
+    args = parser.parse_args()
 
-    catalog = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
-    entries = catalog.get("scheme_entries", [])
+    import refresh_pipeline
+    discovery_session = requests.Session()
+    discovery_session.headers.update(HEADERS)
+    entries = refresh_pipeline.discover_udh_entries(
+        discovery_session,
+        retries=0,
+        interval=args.delay,
+        cache_ttl=0,
+        use_cache=False,
+        persist=True,
+    )
+    catalog = json.loads(CATALOG_PATH.read_text(encoding="utf-8")) if CATALOG_PATH.exists() else {}
+    if args.max_pages is not None:
+        entries = entries[:max(0, args.max_pages)]
     if not entries:
         raise SystemExit("No scheme entries found in discovery catalog.")
 
@@ -147,6 +163,14 @@ def main():
     all_observations = []
     errors = []
     scheme_results = []
+    progress = {"entries": {}, "updated_at_utc": None}
+    if args.progress.exists():
+        try:
+            loaded = json.loads(args.progress.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                progress.update(loaded)
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
 
     for index, entry in enumerate(entries, start=1):
         listing_url = entry.get("official_listing_url", "")
@@ -176,7 +200,37 @@ def main():
             continue
 
         try:
+            saved = progress.get("entries", {}).get(listing_url)
+            if isinstance(saved, dict) and saved.get("status") == "success":
+                observations = saved.get("observations", [])
+                for observation in observations:
+                    observation["source_authority"] = catalog.get(
+                        "source_authority", "Jaipur Development Authority"
+                    )
+                    observation["catalog_entry_number"] = index
+                    observation["catalog_scheme_name"] = scheme_name
+                    observation["catalog_reported_auction_count"] = reported_count
+                    all_observations.append(observation)
+                result["http_status"] = saved.get("http_status", 200)
+                result["parsed_row_count"] = len(observations)
+                result["unique_auction_ids_in_page"] = len({
+                    o["auction_id"] for o in observations
+                })
+                result["counts_match"] = saved.get("counts_match")
+                scheme_results.append(result)
+                continue
             response = session.get(listing_url, timeout=TIMEOUT_SECONDS)
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After", "")
+                result["error"] = "HTTP 429 rate limited"
+                errors.append(result.copy())
+                progress.setdefault("entries", {})[listing_url] = {
+                    "status": "rate_limited",
+                    "retry_after": retry_after,
+                }
+                args.progress.parent.mkdir(parents=True, exist_ok=True)
+                args.progress.write_text(json.dumps(progress, indent=2), encoding="utf-8")
+                break
             result["http_status"] = response.status_code
             response.raise_for_status()
 
@@ -200,6 +254,12 @@ def main():
                 observation["catalog_scheme_name"] = scheme_name
                 observation["catalog_reported_auction_count"] = reported_count
                 all_observations.append(observation)
+            progress.setdefault("entries", {})[listing_url] = {
+                "status": "success",
+                "http_status": response.status_code,
+                "observations": observations,
+                "counts_match": result["counts_match"],
+            }
 
             if result["counts_match"] is False:
                 result["error"] = (
@@ -219,14 +279,28 @@ def main():
             errors.append(result.copy())
 
         scheme_results.append(result)
-        time.sleep(DELAY_SECONDS)
+        progress["updated_at_utc"] = now_utc()
+        args.progress.parent.mkdir(parents=True, exist_ok=True)
+        args.progress.write_text(json.dumps(progress, indent=2), encoding="utf-8")
+        time.sleep(max(0.0, args.delay))
 
-    # Preserve every observation; this is not deduplicated by auction ID.
     id_counts = Counter(o["auction_id"] for o in all_observations)
     repeated_ids = {
         auction_id: count for auction_id, count in sorted(id_counts.items())
         if count > 1
     }
+
+    deduped = {}
+    for observation in all_observations:
+        auction_id = str(observation["auction_id"])
+        if auction_id not in deduped:
+            deduped[auction_id] = dict(observation)
+            deduped[auction_id]["source_provenance"] = []
+        deduped[auction_id]["source_provenance"].append({
+            "listing_url": observation.get("listing_url"),
+            "catalog_scheme_name": observation.get("catalog_scheme_name"),
+            "catalog_entry_number": observation.get("catalog_entry_number"),
+        })
 
     output = {
         "source_authority": catalog.get(
@@ -241,10 +315,11 @@ def main():
         ),
         "scheme_pages_with_errors_or_mismatches": len(errors),
         "observation_count": len(all_observations),
+        "deduplicated_record_count": len(deduped),
         "unique_auction_id_count": len(id_counts),
         "repeated_auction_ids_across_observations": repeated_ids,
         "scheme_results": scheme_results,
-        "observations": all_observations,
+        "observations": list(deduped.values()),
         "important_note": (
             "Read-only prototype output. Observations are intentionally not "
             "deduplicated. Portal listing does not establish current availability, "

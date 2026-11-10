@@ -26,6 +26,155 @@ def property_item(auction_id="A-1"):
 
 
 class PropertyAnalysisTests(unittest.TestCase):
+    def test_normalized_area_uses_square_metre_metadata_for_square_feet(self):
+        record = {
+            "_jda_staging": {
+                "normalized_area": {
+                    "square_metre_value": 9.290304,
+                    "unit": "Square Feet",
+                }
+            }
+        }
+        self.assertAlmostEqual(
+            app.normalized_area_for_record(record, "100 Square Feet"),
+            9.290304,
+        )
+
+    def test_normalized_area_preserves_square_metre_value(self):
+        record = {
+            "_jda_staging": {
+                "normalized_area": {
+                    "square_metre_value": 100.0,
+                    "unit": "Square Meter",
+                }
+            }
+        }
+        self.assertEqual(
+            app.normalized_area_for_record(record, "100 Square Meter"),
+            100.0,
+        )
+
+    def test_normalized_area_falls_back_for_legacy_records(self):
+        self.assertEqual(
+            app.normalized_area_for_record({}, "100 Square Meter"),
+            100.0,
+        )
+
+    def test_official_links_accept_nested_lists_without_duplicates(self):
+        listing = "https://udhonline.rajasthan.gov.in/Portal/PortalAuctionList?q=1"
+        report = "https://udhonline.rajasthan.gov.in/Portal/LiveAuctionDetailReport?q=1"
+        self.assertEqual(
+            app.official_links([listing, {"url": report}, listing]),
+            [listing, report],
+        )
+
+    def test_load_catalogue_uses_normalized_area_and_report_links(self):
+        records = [
+            {
+                "auction_id": "sqft",
+                "title": "Square feet",
+                "scheme_name": "Scheme",
+                "property_number": "1",
+                "property_area": "100 Square Feet",
+                "assessed_value": "1,000.00 (INR)",
+                "emd_end": "11-Nov-2026 10:00 AM",
+                "bid_end": "12-Nov-2026 10:00 AM",
+                "source_url": "https://udhonline.rajasthan.gov.in/Portal/PortalAuctionList?q=1",
+                "listing_url": "https://udhonline.rajasthan.gov.in/Portal/PortalAuctionList?q=1",
+                "detail_links": [
+                    "https://udhonline.rajasthan.gov.in/Portal/LiveAuctionDetailReport?q=1"
+                ],
+                "source_provenance": {
+                    "report_urls": [
+                        "https://udhonline.rajasthan.gov.in/Portal/LiveAuctionDetailReport?q=1"
+                    ],
+                    "detail_urls": [],
+                },
+                "_jda_staging": {
+                    "normalized_area": {
+                        "square_metre_value": 9.290304,
+                        "unit": "Square Feet",
+                    }
+                },
+            },
+            {
+                "auction_id": "legacy",
+                "title": "Legacy",
+                "scheme_name": "Scheme",
+                "property_number": "2",
+                "property_area": "100 Square Meter",
+                "assessed_value": "2,000.00 (INR)",
+                "emd_end": "11-Nov-2026 10:00 AM",
+                "bid_end": "12-Nov-2026 10:00 AM",
+                "source_url": "https://udhonline.rajasthan.gov.in/Portal/PortalAuctionList?q=2",
+                "listing_url": "https://udhonline.rajasthan.gov.in/Portal/PortalAuctionList?q=2",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            data_file = Path(directory) / "catalogue.json"
+            data_file.write_text(json.dumps({"records": records}), encoding="utf-8")
+            old_data_file = app.DATA_FILE
+            old_snapshot = app.latest_snapshot_file
+            app.DATA_FILE = data_file
+            app.latest_snapshot_file = lambda: None
+            try:
+                items, _ = app.load_catalogue()
+            finally:
+                app.DATA_FILE = old_data_file
+                app.latest_snapshot_file = old_snapshot
+        by_id = {item["auction_id"]: item for item in items}
+        self.assertAlmostEqual(by_id["sqft"]["_area"], 9.290304)
+        self.assertEqual(by_id["legacy"]["_area"], 100)
+        self.assertIn(
+            "https://udhonline.rajasthan.gov.in/Portal/LiveAuctionDetailReport?q=1",
+            by_id["sqft"]["detail_links"],
+        )
+        self.assertEqual(
+            by_id["sqft"]["source_url"],
+            "https://udhonline.rajasthan.gov.in/Portal/PortalAuctionList?q=1",
+        )
+        self.assertEqual(
+            by_id["sqft"]["listing_links"],
+            ["https://udhonline.rajasthan.gov.in/Portal/PortalAuctionList?q=1"],
+        )
+
+    def test_load_catalogue_exposes_nested_jda_report_and_detail_links(self):
+        report_url = "https://udhonline.rajasthan.gov.in/Portal/LiveAuctionDetailReport?q=jda"
+        detail_url = "https://udhonline.rajasthan.gov.in/Portal/ViewAuction?q=jda"
+        listing_url = "https://udhonline.rajasthan.gov.in/Portal/PortalAuctionList?q=jda"
+        records = [{
+            "auction_id": "jda-1",
+            "title": "JDA property",
+            "scheme_name": "JDA Scheme",
+            "property_number": "1",
+            "property_area": "100 Square Meter",
+            "usage_type": "Residential",
+            "assessed_value": "1,000.00 (INR)",
+            "emd_end": "11-Nov-2026 10:00 AM",
+            "bid_end": "12-Nov-2026 10:00 AM",
+            "source_url": listing_url,
+            "listing_url": listing_url,
+            "source_provenance": {
+                "report_urls": [report_url, report_url],
+                "detail_urls": [detail_url],
+            },
+        }]
+        with tempfile.TemporaryDirectory() as directory:
+            data_file = Path(directory) / "catalogue.json"
+            data_file.write_text(json.dumps({"records": records}), encoding="utf-8")
+            old_data_file = app.DATA_FILE
+            old_snapshot = app.latest_snapshot_file
+            app.DATA_FILE = data_file
+            app.latest_snapshot_file = lambda: None
+            try:
+                items, _ = app.load_catalogue()
+            finally:
+                app.DATA_FILE = old_data_file
+                app.latest_snapshot_file = old_snapshot
+        self.assertEqual(items[0]["source_url"], listing_url)
+        self.assertEqual(items[0]["listing_links"], [listing_url])
+        self.assertEqual(items[0]["detail_links"], [detail_url, report_url])
+
     def setUp(self):
         self.client = app.app.test_client()
         token = base64.b64encode(b"viewer:analysis-test-password").decode()
@@ -45,6 +194,41 @@ class PropertyAnalysisTests(unittest.TestCase):
         self.assertIsNone(app.numeric_price(""))
         self.assertIsNone(app.numeric_price("not a price"))
 
+    def test_listing_classification_uses_current_ist_time_and_emd_gate(self):
+        now = app.datetime(2026, 11, 3, 10, 0, tzinfo=app.IST)
+        item = {
+            "_bid_dt": app.datetime(2026, 11, 4, 10, 0, tzinfo=app.IST),
+            "emd_end": "02-Nov-2026 10:00 AM",
+            "_source_status": "",
+            "area": "100 Square Meter",
+        }
+        result = app.classify_listing(item, now)
+        self.assertEqual(result["status_group"], "unverified")
+        self.assertEqual(result["_area"], 100)
+
+    def test_listing_classification_distinguishes_expired_active_and_completed(self):
+        now = app.datetime(2026, 11, 3, 10, 0, tzinfo=app.IST)
+        base = {
+            "_bid_dt": app.datetime(2026, 11, 4, 10, 0, tzinfo=app.IST),
+            "emd_end": "04-Nov-2026 10:00 AM",
+            "area": "50 Sqm",
+        }
+        self.assertEqual(
+            app.classify_listing(dict(base, _source_status="live"), now)["status_group"],
+            "active",
+        )
+        self.assertEqual(
+            app.classify_listing(
+                dict(base, _bid_dt=app.datetime(2026, 11, 2, 10, 0, tzinfo=app.IST), _source_status=""),
+                now,
+            )["status_group"],
+            "expired",
+        )
+        self.assertEqual(
+            app.classify_listing(dict(base, _source_status="historical"), now)["status_group"],
+            "completed",
+        )
+
     def test_missing_history_is_honest(self):
         item = property_item()
         with patch.object(app, "resolve_property", return_value=item), patch.object(
@@ -53,6 +237,27 @@ class PropertyAnalysisTests(unittest.TestCase):
             response = self.client.get("/property/A-1/analysis", headers=self.headers)
         self.assertEqual(response.status_code, 200)
         self.assertIn("No verified property-specific historical observation", response.get_data(as_text=True))
+
+    def test_authenticated_refresh_button_promotes_through_pipeline(self):
+        manifest = {
+            "run_id": "test-run",
+            "checked_at": "2026-10-31T00:00:00+00:00",
+            "sources": [],
+            "production_promotions": [{
+                "target": "data/jda_post_auction_latest.json",
+                "record_count": 1,
+            }],
+        }
+        with patch("refresh_pipeline.run_pipeline", return_value=manifest):
+            response = self.client.post("/refresh", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("test-run", response.get_data(as_text=True))
+
+    def test_refresh_requires_authentication(self):
+        with patch("refresh_pipeline.run_pipeline") as run_pipeline:
+            response = self.client.post("/refresh")
+        self.assertEqual(response.status_code, 401)
+        run_pipeline.assert_not_called()
 
     def test_post_auction_observation_has_source_attribution(self):
         item = property_item()
@@ -325,6 +530,16 @@ class PropertyAnalysisTests(unittest.TestCase):
             audit["included"][0]["source_url"],
             base["source_url"],
         )
+        self.assertEqual(audit["source_status"], "available")
+
+    def test_comparable_source_missing_is_explicitly_unavailable(self):
+        item = property_item()
+        with patch.object(app, "POST_AUCTION_FILE", Path("missing-post-auction.json")):
+            audit = app.audit_comparable_auctions(item)
+        self.assertEqual(audit["included"], [])
+        self.assertEqual(audit["source_status"], "unavailable")
+        self.assertEqual(audit["excluded"], 0)
+        self.assertIn("unavailable", audit["source_message"])
 
     def test_transport_alias_does_not_accept_wrong_zone_when_target_zone_is_known(self):
         item = property_item("T-1")

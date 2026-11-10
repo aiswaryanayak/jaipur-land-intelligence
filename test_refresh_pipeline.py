@@ -9,9 +9,132 @@ from requests.exceptions import ProxyError
 import refresh_pipeline
 import promote_staging
 import render_connectivity
+import run_jda_batches
 
 
 class RefreshPipelineTests(unittest.TestCase):
+    def test_jda_batch_selection_skips_terminal_checkpoint_entries(self):
+        discovery = {"scheme_entries": [
+            {"official_listing_url": "https://udhonline.rajasthan.gov.in/Portal/PortalAuctionList?q=success", "discovery_status": "current"},
+            {"official_listing_url": "https://udhonline.rajasthan.gov.in/Portal/PortalAuctionList?q=failed", "discovery_status": "current"},
+            {"official_listing_url": "https://udhonline.rajasthan.gov.in/Portal/PortalAuctionList?q=new", "discovery_status": "current"},
+        ]}
+        progress = {"entries": {
+            discovery["scheme_entries"][0]["official_listing_url"]: {"status": "success"},
+            discovery["scheme_entries"][1]["official_listing_url"]: {"status": "failed"},
+        }}
+        selected = run_jda_batches.select_entries(
+            discovery, progress, pages=20, remaining=False,
+        )
+        self.assertEqual(
+            [entry["official_listing_url"] for entry in selected],
+            [discovery["scheme_entries"][2]["official_listing_url"]],
+        )
+
+    def test_jda_dry_run_preserves_checkpoint_and_reports_cumulative_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            discovery = root / "discovery.json"
+            progress = root / "progress.json"
+            url = "https://udhonline.rajasthan.gov.in/Portal/PortalAuctionList?q=current"
+            discovery.write_text(json.dumps({"scheme_entries": [{
+                "official_listing_url": url,
+                "discovery_status": "current",
+            }]}), encoding="utf-8")
+            original = {"entries": {url: {
+                "status": "success",
+                "records": [{"auction_id": "1", "emd_end": "17-Nov-2026 12:00 PM", "bid_end": "18-Nov-2026 01:30 PM"}],
+            }}}
+            progress.write_text(json.dumps(original), encoding="utf-8")
+            result = run_jda_batches.collect(
+                pages=20, dry_run=True, discovery_file=discovery,
+                progress_file=progress,
+            )
+            self.assertEqual(result["selected_pages"], 0)
+            self.assertEqual(result["unique_records"], 1)
+            self.assertEqual(json.loads(progress.read_text(encoding="utf-8")), original)
+
+    def test_jda_batch_429_is_checkpointed_and_stops_without_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            discovery = root / "discovery.json"
+            progress = root / "progress.json"
+            url = "https://udhonline.rajasthan.gov.in/Portal/PortalAuctionList?q=current"
+            discovery.write_text(json.dumps({"scheme_entries": [{
+                "official_listing_url": url,
+                "discovery_status": "current",
+            }]}), encoding="utf-8")
+            with patch(
+                "run_jda_batches.refresh_pipeline.fetch",
+                side_effect=refresh_pipeline.RateLimitedError(url, "30"),
+            ) as fetch:
+                result = run_jda_batches.collect(
+                    pages=20, discovery_file=discovery, progress_file=progress,
+                )
+            self.assertEqual(result["stopped"], "HTTP 429")
+            self.assertEqual(fetch.call_count, 1)
+            saved = json.loads(progress.read_text(encoding="utf-8"))
+            self.assertEqual(saved["entries"][url]["status"], "rate_limited")
+
+    def test_discovery_merges_current_urls_and_preserves_historical_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old_file = refresh_pipeline.DISCOVERY_FILE
+            refresh_pipeline.DISCOVERY_FILE = Path(directory) / "discovery.json"
+            refresh_pipeline.DISCOVERY_FILE.write_text(json.dumps({
+                "scheme_entries": [{
+                    "official_listing_url": "https://udhonline.rajasthan.gov.in/Portal/PortalAuctionList?q=old",
+                    "scheme_name": "Old scheme",
+                    "reported_auction_count": 1,
+                }],
+            }), encoding="utf-8")
+            try:
+                index = (
+                    '<a href="/Portal/LiveAuctionDetailReport?q=report">report</a>'
+                )
+                report = (
+                    '<tr><td><a href="/Portal/PortalAuctionList?q=new">'
+                    'New scheme 2</a></td></tr>'
+                )
+                with patch("refresh_pipeline.fetch", side_effect=[
+                    (index, 200, False), (report, 200, False)
+                ]):
+                    entries = refresh_pipeline.discover_udh_entries(
+                        Mock(), retries=0, interval=0, cache_ttl=0,
+                        use_cache=False,
+                    )
+                payload = json.loads(refresh_pipeline.DISCOVERY_FILE.read_text(encoding="utf-8"))
+            finally:
+                refresh_pipeline.DISCOVERY_FILE = old_file
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(payload["current_scheme_entry_count"], 1)
+            statuses = {
+                item["official_listing_url"]: item["discovery_status"]
+                for item in payload["scheme_entries"]
+            }
+            self.assertEqual(statuses["https://udhonline.rajasthan.gov.in/Portal/PortalAuctionList?q=new"], "current")
+            self.assertEqual(statuses["https://udhonline.rajasthan.gov.in/Portal/PortalAuctionList?q=old"], "historical")
+
+    def test_rate_limit_stops_collection_and_writes_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            progress = Path(directory) / "progress.json"
+            with patch("refresh_pipeline.discover_udh_entries", return_value=[{
+                "official_listing_url": "https://udhonline.rajasthan.gov.in/Portal/PortalAuctionList?q=new",
+                "scheme_name": "New",
+                "reported_auction_count": 1,
+            }]), patch(
+                "refresh_pipeline.fetch",
+                side_effect=refresh_pipeline.RateLimitedError("https://example", "30"),
+            ):
+                with self.assertRaises(refresh_pipeline.RateLimitedError):
+                    refresh_pipeline.collect_udh_catalogue(
+                        Mock(), retries=0, interval=0, cache_ttl=0,
+                        use_cache=False, progress_file=progress,
+                    )
+            checkpoint = json.loads(progress.read_text(encoding="utf-8"))
+            result = next(iter(checkpoint["entries"].values()))
+            self.assertEqual(result["status"], "rate_limited")
+            self.assertEqual(result["retry_after"], "30")
+
     def test_connectivity_check_reports_each_layer_without_downloading_bodies(self):
         response = Mock(status_code=204, headers={"Content-Type": "text/html"})
         response.close = Mock()
@@ -150,22 +273,25 @@ class RefreshPipelineTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             refresh_pipeline.validate_catalogue_records([malformed])
 
-    def test_collect_udh_catalogue_fetches_all_discovered_schemes_and_preserves_duplicates(self):
+    def test_collect_udh_catalogue_fetches_all_discovered_schemes_and_deduplicates_ids(self):
         entries = [
             {"scheme_name": "One", "official_listing_url": "https://udhonline.rajasthan.gov.in/one", "reported_auction_count": 1},
             {"scheme_name": "Two", "official_listing_url": "https://udhonline.rajasthan.gov.in/two", "reported_auction_count": 1},
         ]
         records = [self._udh_record("1"), self._udh_record("1")]
-        with patch("refresh_pipeline.discover_udh_entries", return_value=entries), \
-             patch("refresh_pipeline.fetch", side_effect=[("<one>", 200, False), ("<two>", 200, False)]), \
-             patch("refresh_pipeline.parse_page", side_effect=[
-                 ([records[0]], "one"), ([records[1]], "two")
-             ]):
-            result, details = refresh_pipeline.collect_udh_catalogue(
-                Mock(), retries=1, interval=0, cache_ttl=0, use_cache=False,
-            )
-        self.assertEqual(len(result), 2)
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("refresh_pipeline.discover_udh_entries", return_value=entries), \
+                 patch("refresh_pipeline.fetch", side_effect=[("<one>", 200, False), ("<two>", 200, False)]), \
+                 patch("refresh_pipeline.parse_page", side_effect=[
+                     ([records[0]], "one"), ([records[1]], "two")
+                 ]):
+                result, details = refresh_pipeline.collect_udh_catalogue(
+                    Mock(), retries=1, interval=0, cache_ttl=0, use_cache=False,
+                    progress_file=Path(directory) / "progress.json",
+                )
+        self.assertEqual(len(result), 1)
         self.assertEqual(details["scheme_count"], 2)
+        self.assertEqual(len(result[0]["source_provenance"]), 2)
 
     def test_catalogue_promotion_is_atomic_and_rejects_invalid_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -271,25 +397,23 @@ class RefreshPipelineTests(unittest.TestCase):
         self.assertEqual(result["record_count"], 0)
         self.assertEqual(result["error"], "HTTP 429")
 
-    def test_retry_after_is_respected_for_rate_limit(self):
+    def test_rate_limit_stops_without_retrying_rate_limited_url(self):
         with tempfile.TemporaryDirectory() as directory:
             old_cache = refresh_pipeline.CACHE_DIR
             refresh_pipeline.CACHE_DIR = Path(directory)
             try:
                 session = Mock()
                 limited = Mock(status_code=429, headers={"Retry-After": "7"})
-                success = Mock(status_code=200, text="ok", headers={})
-                session.get.side_effect = [limited, success]
-                limited.raise_for_status.side_effect = __import__(
-                    "requests"
-                ).HTTPError("429")
+                session.get.side_effect = [limited]
                 with patch("refresh_pipeline.time.sleep") as sleep:
-                    body, status, cached = refresh_pipeline.fetch(
+                    with self.assertRaises(refresh_pipeline.RateLimitedError) as raised:
+                        refresh_pipeline.fetch(
                         session, "https://example.test/rate", retries=1,
                         interval=0, cache_ttl=0, use_cache=False,
-                    )
-                self.assertEqual((body, status, cached), ("ok", 200, False))
-                self.assertIn(7.0, [call.args[0] for call in sleep.call_args_list])
+                        )
+                self.assertEqual(raised.exception.retry_after, "7")
+                self.assertEqual(session.get.call_count, 1)
+                self.assertEqual(sleep.call_count, 0)
             finally:
                 refresh_pipeline.CACHE_DIR = old_cache
 

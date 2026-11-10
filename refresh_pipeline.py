@@ -40,6 +40,7 @@ UDH_INDEX_URL = "https://udhonline.rajasthan.gov.in/Portal/AuctionListNew"
 POST_AUCTION_FILE = ROOT / "data" / "jda_post_auction_latest.json"
 CATALOGUE_FILE = ROOT / "deploy_data" / "auctions.json"
 DISCOVERY_FILE = ROOT / "data" / "udh_test" / "jda_scheme_discovery.json"
+UDH_PROGRESS_FILE = ROOT / "data" / "udh_test" / "jda_live_collection_progress.json"
 REFRESH_LOCK_FILE = PIPELINE_DIR / "refresh.lock"
 
 
@@ -55,6 +56,25 @@ def cache_key(url: str) -> str:
     return hashlib.sha256(url.encode("utf-8")).hexdigest()
 
 
+class RateLimitedError(RuntimeError):
+    """Raised when an official source asks the collector to slow down."""
+
+    def __init__(self, url: str, retry_after: str = ""):
+        self.url = url
+        self.retry_after = retry_after
+        super().__init__("HTTP 429 from official source")
+
+
+def atomic_json_write(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
 def fetch(
     session: requests.Session,
     url: str,
@@ -63,6 +83,8 @@ def fetch(
     interval: float,
     cache_ttl: int,
     use_cache: bool,
+    connect_timeout: float = 10.0,
+    read_timeout: float = 30.0,
 ) -> tuple[str, int, bool]:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     body_path = CACHE_DIR / f"{cache_key(url)}.body"
@@ -78,8 +100,12 @@ def fetch(
         if attempt:
             time.sleep(min(120.0, 2**(attempt - 1)))
         try:
-            response = session.get(url, timeout=60)
-            if response.status_code == 429 or response.status_code >= 500:
+            response = session.get(url, timeout=(connect_timeout, read_timeout))
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After", "")
+                response.close()
+                raise RateLimitedError(url, retry_after)
+            if response.status_code >= 500:
                 retry_after = response.headers.get("Retry-After", "")
                 try:
                     retry_seconds = min(120.0, max(0.0, float(retry_after)))
@@ -105,9 +131,35 @@ def fetch(
                 encoding="utf-8",
             )
             return response.text, response.status_code, False
+        except RateLimitedError:
+            raise
         except requests.RequestException as exc:
             last_error = exc
     raise RuntimeError(f"Fetch failed after {retries + 1} attempts: {last_error}")
+
+
+def connectivity_diagnostic(exc: Exception) -> dict[str, str]:
+    """Return a concise, non-secret classification for source failures."""
+    message = str(exc)
+    lowered = message.casefold()
+    if "proxy" in lowered or "tunnel" in lowered:
+        category = "proxy_or_egress"
+    elif "dns" in lowered or "name resolution" in lowered or "getaddrinfo" in lowered:
+        category = "dns"
+    elif "ssl" in lowered or "certificate" in lowered or "tls" in lowered:
+        category = "tls"
+    elif "429" in lowered or "rate" in lowered:
+        category = "rate_limited"
+    elif "timeout" in lowered or "timed out" in lowered:
+        category = "timeout"
+    else:
+        category = "connection"
+    return {
+        "category": category,
+        "proxy_configured": "yes" if any(
+            os.environ.get(name) for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
+        ) else "no",
+    }
 
 
 def validate_catalogue_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -173,8 +225,9 @@ def discover_udh_entries(
     interval: float,
     cache_ttl: int,
     use_cache: bool,
+    persist: bool = True,
 ) -> list[dict[str, Any]]:
-    """Discover current UDH report and scheme listing links from the index."""
+    """Discover current UDH links and merge them into the historical registry."""
     index_body, _, _ = fetch(
         session, UDH_INDEX_URL, retries=retries, interval=interval,
         cache_ttl=cache_ttl, use_cache=use_cache,
@@ -188,15 +241,16 @@ def discover_udh_entries(
     if not report_urls:
         raise ValueError("UDH index contains no live-auction report links")
 
-    known_entries: dict[str, dict[str, Any]] = {}
+    existing: dict[str, Any] = {}
     if DISCOVERY_FILE.exists():
         try:
             payload = json.loads(DISCOVERY_FILE.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("UDH discovery metadata is not an object")
+            existing = payload
             known_entries = {
                 str(entry.get("official_listing_url")): entry
-                for entry in payload.get("scheme_entries", [])
+                for entry in existing.get("scheme_entries", [])
                 if isinstance(entry, dict) and entry.get("official_listing_url")
             }
         except (OSError, ValueError, json.JSONDecodeError):
@@ -232,9 +286,39 @@ def discover_udh_entries(
                 if known.get("reported_auction_count") is not None
                 else (int(numbers[-1]) if numbers else None),
                 "official_listing_url": listing_url,
+                "discovery_status": "current",
+                "last_seen_at_utc": utc_now().isoformat(),
             })
     if not entries:
         raise ValueError("UDH reports contain no scheme listing links")
+    if persist:
+        current_by_url = {entry["official_listing_url"]: entry for entry in entries}
+        merged = dict(existing)
+        merged.update({
+            "source_authority": "Jaipur Development Authority",
+            "source_summary_url": UDH_INDEX_URL,
+            "retrieved_at_utc": utc_now().isoformat(),
+            "report_count": len(report_urls),
+            "live_report_urls": sorted(report_urls),
+        })
+        merged_entries = []
+        for url, entry in known_entries.items():
+            if url not in current_by_url:
+                historical = dict(entry)
+                historical["discovery_status"] = "historical"
+                merged_entries.append(historical)
+        merged_entries.extend(entries)
+        merged["scheme_entries"] = sorted(
+            merged_entries,
+            key=lambda item: (
+                item.get("discovery_status") != "current",
+                str(item.get("scheme_name") or ""),
+                str(item.get("official_listing_url") or ""),
+            ),
+        )
+        merged["scheme_entry_count"] = len(merged["scheme_entries"])
+        merged["current_scheme_entry_count"] = len(entries)
+        atomic_json_write(DISCOVERY_FILE, merged)
     return entries
 
 
@@ -245,45 +329,126 @@ def collect_udh_catalogue(
     interval: float,
     cache_ttl: int,
     use_cache: bool,
+    batch_size: int = 25,
+    max_pages: int | None = None,
+    progress_file: Path = UDH_PROGRESS_FILE,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Fetch every discovered official UDH scheme page, not just its IDs."""
+    """Fetch current scheme pages with resumable, rate-limited progress."""
     entries = discover_udh_entries(
         session, retries=retries, interval=interval,
-        cache_ttl=cache_ttl, use_cache=use_cache,
+        cache_ttl=cache_ttl, use_cache=use_cache, persist=True,
     )
+    entries = entries[:max_pages] if max_pages is not None else entries
+    progress = {"entries": {}, "updated_at_utc": None}
+    if progress_file.exists():
+        try:
+            loaded = json.loads(progress_file.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                progress.update(loaded)
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    completed = progress.setdefault("entries", {})
 
     records: list[dict[str, Any]] = []
     expected_count = 0
-    for entry in entries:
-        if not isinstance(entry, dict):
-            raise ValueError("UDH discovery contains an invalid scheme entry")
-        url = str(entry.get("official_listing_url") or "").strip()
-        parsed = urlparse(url)
-        if parsed.scheme != "https" or parsed.netloc.lower() != "udhonline.rajasthan.gov.in":
-            raise ValueError(f"UDH discovery contains an unapproved URL: {url}")
-        expected = entry.get("reported_auction_count")
-        if isinstance(expected, int):
-            expected_count += expected
-        body, _, _ = fetch(
-            session, url, retries=retries, interval=interval,
-            cache_ttl=cache_ttl, use_cache=use_cache,
+    for offset in range(0, len(entries), max(1, batch_size)):
+        batch = entries[offset:offset + max(1, batch_size)]
+        for entry in batch:
+            if not isinstance(entry, dict):
+                raise ValueError("UDH discovery contains an invalid scheme entry")
+            url = str(entry.get("official_listing_url") or "").strip()
+            parsed = urlparse(url)
+            if parsed.scheme != "https" or parsed.netloc.lower() != "udhonline.rajasthan.gov.in":
+                raise ValueError(f"UDH discovery contains an unapproved URL: {url}")
+            expected = entry.get("reported_auction_count")
+            if isinstance(expected, int):
+                expected_count += expected
+            cached_result = completed.get(url)
+            if isinstance(cached_result, dict) and cached_result.get("status") == "success":
+                page_records = cached_result.get("records", [])
+            else:
+                try:
+                    body, _, _ = fetch(
+                        session, url, retries=0, interval=interval,
+                        cache_ttl=cache_ttl, use_cache=use_cache,
+                    )
+                    page_records, _ = parse_page(
+                        body, url, entry, utc_now().isoformat(),
+                    )
+                    validate_catalogue_records(page_records)
+                    if not page_records:
+                        raise ValueError(
+                            f"UDH scheme returned no records: {entry.get('scheme_name')}"
+                        )
+                    completed[url] = {
+                        "status": "success",
+                        "record_count": len(page_records),
+                        "records": page_records,
+                        "retrieved_at_utc": utc_now().isoformat(),
+                    }
+                except RateLimitedError as exc:
+                    completed[url] = {
+                        "status": "rate_limited",
+                        "retry_after": exc.retry_after,
+                        "updated_at_utc": utc_now().isoformat(),
+                    }
+                    progress["updated_at_utc"] = utc_now().isoformat()
+                    atomic_json_write(progress_file, progress)
+                    raise
+                except (requests.RequestException, RuntimeError, ValueError) as exc:
+                    completed[url] = {
+                        "status": "failed",
+                        "error_type": type(exc).__name__,
+                        "updated_at_utc": utc_now().isoformat(),
+                    }
+                    progress["updated_at_utc"] = utc_now().isoformat()
+                    atomic_json_write(progress_file, progress)
+                    raise
+            records.extend(page_records)
+        progress["updated_at_utc"] = utc_now().isoformat()
+        progress["completed_pages"] = sum(
+            value.get("status") == "success"
+            for value in completed.values()
+            if isinstance(value, dict)
         )
-        page_records, _ = parse_page(
-            body, url, entry, utc_now().isoformat(),
-        )
-        if not page_records:
-            raise ValueError(f"UDH scheme returned no records: {entry.get('scheme_name')}")
-        records.extend(page_records)
+        atomic_json_write(progress_file, progress)
 
     records = validate_catalogue_records(records)
-    if expected_count and len(records) != expected_count:
+    parsed_record_count = len(records)
+    deduped: dict[str, dict[str, Any]] = {}
+    for record in records:
+        auction_id = str(record["auction_id"])
+        if auction_id not in deduped:
+            merged = dict(record)
+            merged["source_provenance"] = [{
+                "source_url": record.get("source_url"),
+                "report_url": record.get("report_url"),
+                "scheme_name": record.get("catalog_scheme_name"),
+            }]
+            deduped[auction_id] = merged
+        else:
+            provenance = deduped[auction_id].setdefault("source_provenance", [])
+            provenance.append({
+                "source_url": record.get("source_url"),
+                "report_url": record.get("report_url"),
+                "scheme_name": record.get("catalog_scheme_name"),
+            })
+    records = list(deduped.values())
+    if expected_count and parsed_record_count != expected_count:
         raise ValueError(
-            f"UDH catalogue is incomplete: parsed {len(records)}, expected {expected_count}"
+            f"UDH catalogue is incomplete: parsed {parsed_record_count}, expected {expected_count}"
         )
     return records, {
         "scheme_count": len(entries),
         "expected_record_count": expected_count,
+        "parsed_record_count": parsed_record_count,
         "record_count": len(records),
+        "unique_auction_id_count": len(records),
+        "progress_file": str(
+            progress_file.relative_to(ROOT)
+            if progress_file.is_relative_to(ROOT)
+            else progress_file
+        ),
     }
 
 
@@ -299,6 +464,7 @@ def source_result(key: str, url: str, started: datetime) -> dict[str, Any]:
         "new_count": 0,
         "changed_count": 0,
         "error": None,
+        "connectivity": None,
         "run_id": None,
     }
 
@@ -572,11 +738,13 @@ def collect_riico(
                 zone_statuses.append({
                     "unit": unit_name, "status": "stale", "record_count": len(stale),
                     "error_summary": concise_error(last_error) if last_error else "refresh failed",
+                    "connectivity": connectivity_diagnostic(last_error) if last_error else None,
                 })
             else:
                 zone_statuses.append({
                     "unit": unit_name, "status": "failure", "record_count": 0,
                     "error_summary": concise_error(last_error) if last_error else "refresh failed",
+                    "connectivity": connectivity_diagnostic(last_error) if last_error else None,
                 })
         if interval:
             time.sleep(interval)
@@ -635,11 +803,13 @@ def collect_direct(
                 zone_statuses.append({
                     "unit": unit_name, "status": "stale",
                     "error_summary": concise_error(last_error) if last_error else "refresh failed",
+                    "connectivity": connectivity_diagnostic(last_error) if last_error else None,
                 })
             else:
                 zone_statuses.append({
                     "unit": unit_name, "status": "failure",
                     "error_summary": concise_error(last_error) if last_error else "refresh failed",
+                    "connectivity": connectivity_diagnostic(last_error) if last_error else None,
                 })
         if interval:
             time.sleep(interval)
@@ -707,7 +877,8 @@ def _run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             jda_result["source_key"], records, jda_result["fetch_status"]
         )
     except (requests.RequestException, RuntimeError, ValueError) as exc:
-        finish(jda_result, "failure", error=f"{type(exc).__name__}: {exc}")
+        finish(jda_result, "failure", error=concise_error(exc))
+        jda_result["connectivity"] = connectivity_diagnostic(exc)
     jda_result["run_id"] = identifier
     sources.append(jda_result)
 
@@ -716,6 +887,8 @@ def _run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         records, details = collect_udh_catalogue(
             session, retries=args.retries, interval=args.interval,
             cache_ttl=args.cache_ttl, use_cache=not args.no_cache,
+            batch_size=args.udh_batch_size,
+            max_pages=args.udh_max_pages,
         )
         staged["udh_catalogue"] = records
         status = "success"
@@ -725,7 +898,8 @@ def _run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         )
         jda_live_result.update(details)
     except (requests.RequestException, RuntimeError, ValueError, StopIteration) as exc:
-        finish(jda_live_result, "failure", error=f"{type(exc).__name__}: {exc}")
+        finish(jda_live_result, "failure", error=concise_error(exc))
+        jda_live_result["connectivity"] = connectivity_diagnostic(exc)
     jda_live_result["run_id"] = identifier
     sources.append(jda_live_result)
 
@@ -783,6 +957,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--riico-retries", type=int, default=2)
     parser.add_argument("--riico-connect-timeout", type=float, default=10.0)
     parser.add_argument("--riico-read-timeout", type=float, default=30.0)
+    parser.add_argument("--udh-batch-size", type=int, default=25)
+    parser.add_argument("--udh-max-pages", type=int, default=None)
     parser.add_argument(
         "--promote-jda-post-auction",
         action="store_true",
